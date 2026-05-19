@@ -11,7 +11,9 @@ import signal
 import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from lges_recipe_interfaces.srv import SendInstantAction
 
 # 커스텀 인터페이스 로드
 from comm_interfaces.msg import ConnectionState
@@ -27,6 +29,15 @@ from ament_index_python.packages import get_package_share_directory
 
 _INSTANCE_LOCK_FILE = None
 RESPONSE_TYPES = {"ACCEPTED", "REJECTED", "ERROR"}
+DEFAULT_INSTANT_ACTION_ROUTES = {
+    "start_pause": {"action_id": "IA_START_PAUSE_001"},
+    "stop_pause": {"action_id": "IA_STOP_PAUSE_001"},
+    "start_charge": {"action_id": "IA_START_CHARGE_001"},
+    "stop_charge": {"action_id": "IA_STOP_CHARGE_001"},
+    "cancel_order": {"action_id": "IA_CANCEL_ORDER_001"},
+    "clear_instant_actions": {"action_id": "IA_CLEAR_INSTANT_ACTIONS_001"},
+    "request_factsheet": {"action_id": "IA_REQUEST_FACTSHEET_001", "mode": "signal_ui"},
+}
 
 def resolve_config_path():
     env_path = os.environ.get('COMM_MANAGER_CONFIG_PATH')
@@ -138,6 +149,26 @@ class CommNode(Node):
         self.inbound_triggers = self.inbound_config.get('triggers', {}) or {}
         self.response_config = self.inbound_config.get('response', {}) or {}
         self.inbound_trigger_clients = self.create_inbound_trigger_clients()
+        self.instant_action_config = self.inbound_config.get('instant_actions', {}) or {}
+        self.instant_action_enabled = bool(self.instant_action_config.get('enabled', True))
+        self.instant_action_service_name = str(
+            self.instant_action_config.get('service', '/recipe/instant_action')
+        )
+        self.factsheet_request_topic = str(
+            self.instant_action_config.get('factsheet_request_topic', '/comm/request_factsheet')
+            or '/comm/request_factsheet'
+        )
+        self.factsheet_request_pub = self.create_publisher(String, self.factsheet_request_topic, 10)
+        self.instant_action_default_input_json = str(
+            self.instant_action_config.get('default_input_json', '{}')
+        )
+        self.instant_action_action_id_source = str(
+            self.instant_action_config.get('action_id_source', 'route') or 'route'
+        ).strip().lower()
+        configured_routes = self.instant_action_config.get('routes') or {}
+        self.instant_action_routes = self.normalize_instant_action_routes(configured_routes)
+        self.instant_action_fail_fast = bool(self.instant_action_config.get('fail_fast', True))
+        self.instant_action_clients = {}
         self.outbound_config = self.config.get('outbound', {}) or {}
         self.visualization_skip_logged = False
         self.visualization_retained_clear_sent = False
@@ -339,6 +370,196 @@ class CommNode(Node):
         patterns = self.response_config.get('service_error_message_patterns', []) or []
         return any(str(pattern).lower() in text for pattern in patterns)
 
+    def call_inbound_route(self, message_type, payload):
+        if message_type == 'instantActions' and self.instant_action_enabled:
+            return self.call_instant_actions_service(payload)
+        return self.call_inbound_trigger(message_type)
+
+    def normalize_instant_action_routes(self, routes_config):
+        routes = {}
+        source = routes_config if isinstance(routes_config, dict) and routes_config else DEFAULT_INSTANT_ACTION_ROUTES
+        for action_type, route in source.items():
+            normalized_type = str(action_type or '').strip().lower()
+            if not normalized_type:
+                continue
+            if isinstance(route, dict):
+                normalized_route = dict(route)
+            else:
+                normalized_route = {"action_id": str(route)}
+            normalized_route.setdefault("action_id", DEFAULT_INSTANT_ACTION_ROUTES.get(normalized_type, {}).get("action_id", ""))
+            normalized_route.setdefault("service", self.instant_action_service_name)
+            routes[normalized_type] = normalized_route
+        return routes
+
+    def get_instant_action_client(self, service_name):
+        if not service_name:
+            return None
+        client = self.instant_action_clients.get(service_name)
+        if client is None:
+            client = self.create_client(SendInstantAction, service_name)
+            self.instant_action_clients[service_name] = client
+        return client
+
+    def build_instant_action_input_json(self, action):
+        direct_input = (
+            action.get("input_json")
+            if "input_json" in action
+            else action.get("inputJson")
+        )
+        if direct_input is not None:
+            if isinstance(direct_input, str):
+                return direct_input.strip() or self.instant_action_default_input_json
+            return json.dumps(direct_input, ensure_ascii=False)
+
+        params = None
+        for key in ("actionParameters", "actionParams", "parameters"):
+            if key in action:
+                params = action.get(key)
+                break
+
+        if params in (None, [], {}):
+            return self.instant_action_default_input_json
+
+        return json.dumps({"actionParameters": params}, ensure_ascii=False)
+
+    def instant_action_result_reason(self, result, message):
+        response_type = str(getattr(result, 'response_type', '') or '').lower()
+        result_code = str(getattr(result, 'result_code', '') or '').lower()
+        if bool(getattr(result, 'accepted', False)):
+            return "service_accepted"
+        if response_type == "error" or self.classify_trigger_failure(f"{result_code} {message}"):
+            return "service_error"
+        return "service_rejected"
+
+    def call_one_instant_action_service(self, action, index):
+        action_type = str(action.get("actionType") or action.get("action_type") or "").strip().lower()
+        route = self.instant_action_routes.get(action_type, {})
+        source_action_id = str(
+            action.get("actionId")
+            or action.get("action_id")
+        ).strip()
+        route_action_id = str(route.get("action_id") or "").strip()
+        action_id = (
+            source_action_id
+            if self.instant_action_action_id_source == "payload"
+            else (route_action_id or source_action_id)
+        )
+        blocking_type = str(
+            action.get("blockingType")
+            or action.get("blocking_type")
+            or ""
+        ).strip()
+        service_name = str(route.get("service") or self.instant_action_service_name).strip()
+
+        if not source_action_id:
+            return False, f"instantActions[{index}] missing actionId", "service_rejected"
+        if not action_type:
+            return False, f"instantActions[{index}] missing actionType", "service_rejected"
+        if action_type not in self.instant_action_routes:
+            return False, f"unsupported instant action type: {action_type}", "service_rejected"
+        route_mode = str(route.get("mode") or "").strip().lower()
+        if action_type == "request_factsheet" or route_mode in ("signal_ui", "publish_factsheet"):
+            return self.handle_request_factsheet(action, source_action_id, action_id, action_type)
+
+        client = self.get_instant_action_client(service_name)
+        if client is None:
+            return False, "instant action service is not configured", "service_not_configured"
+        if not client.wait_for_service(timeout_sec=self.inbound_service_wait_timeout_sec):
+            return False, f"service unavailable: {service_name}", "service_unavailable"
+
+        request = SendInstantAction.Request()
+        request.action_id = action_id
+        request.action_type = action_type
+        request.blocking_type = blocking_type
+        request.input_json = self.build_instant_action_input_json(action)
+
+        self.get_logger().info(
+            "InstantAction service call -> "
+            f"{service_name}: "
+            f"action_id={request.action_id}, action_type={request.action_type}, "
+            f"blocking_type={request.blocking_type}, input_json={request.input_json}"
+        )
+
+        done = threading.Event()
+        future = client.call_async(request)
+        future.add_done_callback(lambda _future: done.set())
+
+        if not done.wait(timeout=self.inbound_service_timeout_sec):
+            return False, f"service timeout: {service_name}", "service_timeout"
+
+        try:
+            result = future.result()
+        except Exception as e:
+            return False, f"service exception: {e}", "service_exception"
+
+        accepted = bool(getattr(result, 'accepted', False))
+        response_type = str(getattr(result, 'response_type', '') or '')
+        result_code = str(getattr(result, 'result_code', '') or '')
+        message = str(getattr(result, 'message', '') or '')
+        summary = (
+            f"{action_id}/{action_type}: "
+            f"{response_type or ('accepted' if accepted else 'rejected')}"
+        )
+        if result_code:
+            summary += f" ({result_code})"
+        if message:
+            summary += f" - {message}"
+
+        return accepted, summary, self.instant_action_result_reason(result, message)
+
+    def handle_request_factsheet(self, action, source_action_id, mapped_action_id, action_type):
+        try:
+            request_payload = {
+                "actionId": source_action_id,
+                "mappedActionId": mapped_action_id,
+                "actionType": action_type,
+                "timestamp": self.mqtt_core.current_timestamp(),
+                "source": "mqtt.instantActions",
+                "action": action,
+            }
+            msg = String()
+            msg.data = json.dumps(request_payload, ensure_ascii=False)
+            self.factsheet_request_pub.publish(msg)
+            self.get_logger().info(
+                f"Factsheet request signalled -> {self.factsheet_request_topic}: {msg.data}"
+            )
+            return True, (
+                f"{mapped_action_id}/{action_type}: factsheet request signalled "
+                f"({self.factsheet_request_topic})"
+            ), "service_accepted"
+        except Exception as e:
+            return False, f"{mapped_action_id}/{action_type}: factsheet request signal failed: {e}", "service_error"
+
+    def call_instant_actions_service(self, payload):
+        actions = payload.get("instantActions") if isinstance(payload, dict) else None
+        if not isinstance(actions, list) or not actions:
+            return False, "instantActions must be a non-empty array", "service_rejected"
+
+        messages = []
+        final_reason = "service_accepted"
+        all_success = True
+
+        for index, action in enumerate(actions, start=1):
+            if not isinstance(action, dict):
+                all_success = False
+                final_reason = "service_rejected"
+                messages.append(f"instantActions[{index}] must be an object")
+                if self.instant_action_fail_fast:
+                    break
+                continue
+
+            success, message, reason = self.call_one_instant_action_service(action, index)
+            messages.append(message)
+            if not success:
+                all_success = False
+                final_reason = reason
+                if self.instant_action_fail_fast:
+                    break
+            elif final_reason == "service_accepted":
+                final_reason = reason
+
+        return all_success, "; ".join(messages), final_reason
+
     def call_inbound_trigger(self, message_type):
         client, service_name = self.get_inbound_trigger_client(message_type)
         if client is None:
@@ -386,8 +607,9 @@ class CommNode(Node):
         for index, action in enumerate(source_actions, start=1):
             if not isinstance(action, dict):
                 continue
-            action_id = action.get("actionId") or f"ACT_{index:03d}"
-            action_type = action.get("actionType") or "UNKNOWN"
+            action_type = action.get("actionType") or action.get("action_type") or "UNKNOWN"
+            route = self.instant_action_routes.get(str(action_type).strip().lower(), {})
+            action_id = action.get("actionId") or action.get("action_id") or route.get("action_id") or f"ACT_{index:03d}"
             action_descriptor = self.resolve_action_descriptor(
                 action,
                 descriptor_fields,
@@ -636,7 +858,7 @@ class CommNode(Node):
             return
 
         self.get_logger().info("[TaskHandler] 처리 완료 → YAML 저장됨")
-        trigger_success, trigger_message, trigger_reason = self.call_inbound_trigger(message_type)
+        trigger_success, trigger_message, trigger_reason = self.call_inbound_route(message_type, payload)
         self.get_logger().info(
             f"Inbound trigger result [{message_type}]: "
             f"success={trigger_success}, reason={trigger_reason}, message={trigger_message}"

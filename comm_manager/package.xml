@@ -12,6 +12,7 @@
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>comm_interfaces</depend>
+  <depend>lges_recipe_interfaces</depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

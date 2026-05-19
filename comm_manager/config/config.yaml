@@ -46,6 +46,35 @@ inbound:
         - actionDescription
       descriptor_fallback_field: ''
       descriptor_default: ''
+  instant_actions:
+    enabled: true
+    service: /recipe/instant_action
+    factsheet_request_topic: /comm/request_factsheet
+    default_input_json: '{}'
+    action_id_source: route
+    fail_fast: true
+    routes:
+      start_pause:
+        action_id: IA_START_PAUSE_001
+        service: /recipe/instant_action
+      stop_pause:
+        action_id: IA_STOP_PAUSE_001
+        service: /recipe/instant_action
+      start_charge:
+        action_id: IA_START_CHARGE_001
+        service: /recipe/instant_action
+      stop_charge:
+        action_id: IA_STOP_CHARGE_001
+        service: /recipe/instant_action
+      cancel_order:
+        action_id: IA_CANCEL_ORDER_001
+        service: /recipe/instant_action
+      clear_instant_actions:
+        action_id: IA_CLEAR_INSTANT_ACTIONS_001
+        service: /recipe/instant_action
+      request_factsheet:
+        action_id: IA_REQUEST_FACTSHEET_001
+        mode: signal_ui
   triggers:
     order: /comm/order_received
     instantActions: /comm/instant_actions_received
