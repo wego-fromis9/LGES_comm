@@ -1,0 +1,79 @@
+network:
+  manage_wifi: false
+  ssid: B-504
+  password: welcome!2005
+  min_signal_threshold: 140
+mqtt:
+  broker_ip: 192.168.0.71
+  port: 1883
+  max_retries: 10
+  retry_interval: 5
+  publish_connection_on_mqtt_connect: true
+  manual_reconnect_delay: 2
+  disconnect_publish_wait_sec: 0.7
+  timestamp:
+    timezone: UTC
+    use_z_suffix_for_utc: true
+robot:
+  manufacturer: WEGO
+  serial_number: AMR-001
+  version: 2.0.0
+runtime:
+  lock_file: /tmp/lges_comm_node_AMR-001.lock
+inbound:
+  auto_response: true
+  service_wait_timeout_sec: 0.5
+  service_timeout_sec: 3
+  response:
+    response_types:
+      validation_error: ERROR
+      service_not_configured: REJECTED
+      service_unavailable: REJECTED
+      service_timeout: ERROR
+      service_exception: ERROR
+      service_rejected: REJECTED
+      service_error: ERROR
+      service_accepted: ACCEPTED
+    service_error_message_patterns:
+      - error
+      - exception
+      - fault
+      - failed
+      - timeout
+    actions:
+      descriptor_source_fields:
+        - actionDescriptor
+        - actionDescription
+      descriptor_fallback_field: ''
+      descriptor_default: ''
+  triggers:
+    order: /comm/order_received
+    instantActions: /comm/instant_actions_received
+outbound:
+  visualization:
+    enabled: false
+host_setup:
+  ntp_client:
+    enabled: true
+    apply_on_comm_start: false
+    server_from_mqtt_broker: false
+    server: 192.168.0.71
+    chrony_conf: /etc/chrony/chrony.conf
+    disable_public_pools: true
+    disable_dhcp_sources: true
+    disable_other_servers: true
+    restart_chrony: true
+    makestep: true
+    monitor:
+      enabled: true
+      check_on_start: true
+      check_interval_sec: 60
+      run_makestep_on_start: true
+      run_makestep_when_unsynchronised: false
+      max_offset_sec: 1.0
+      log_every_check: false
+      command_timeout_sec: 5
+message_recording:
+  enabled: true
+  output_dir: ~/Documents/lges_mqtt_yaml
+  max_files_per_direction: 1000

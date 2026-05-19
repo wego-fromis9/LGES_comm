@@ -1,0 +1,36 @@
+{
+    "_meta": {
+        "topic_suffix": "state",
+        "qos": 0,
+        "retain": true
+    },
+    "payload": {
+        "headerId": null,
+        "timestamp": null,
+        "version": "2.0.0",
+        "manufacturer": null,
+        "serialNumber": null,
+        "orderId": null,
+        "orderUpdateId": null,
+        "lastNodeId": null,
+        "lastNodeSeqNo": null,
+        "nodeStates": [],
+        "actionStates": [],
+        "instantActionStates": [],
+        "robotPosition": null,
+        "velocity": null,
+        "driving": false,
+        "batteryState": {
+            "batteryCharge": null,
+            "batteryVoltage": null,
+            "batteryCurrent": null,
+            "batteryHealth": null,
+            "charging": false,
+            "reach": null
+        },
+        "controlState": null,
+        "operationState": null,
+        "safetyState": null,
+        "errors": []
+    }
+}

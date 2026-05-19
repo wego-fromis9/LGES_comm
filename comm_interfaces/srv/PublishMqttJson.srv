@@ -1,0 +1,21 @@
+# MQTT message type suffix such as connection, factsheet, state, visualization.
+string message_type
+
+# JSON object payload. The comm manager fills headerId, timestamp,
+# manufacturer, serialNumber, and version from config/template.
+string payload_json
+
+# Set to -1 to use the template default QoS.
+int32 qos
+
+# If override_retain is false, retain is taken from the template.
+bool override_retain
+bool retain
+
+# If true, merge payload_json into comm_manager/json_templates/{message_type}.json.
+bool use_template
+---
+bool success
+string topic
+string message
+string payload_json

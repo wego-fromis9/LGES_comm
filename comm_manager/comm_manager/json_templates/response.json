@@ -1,0 +1,18 @@
+{
+    "_meta": {
+        "topic_suffix": "response",
+        "qos": 1,
+        "retain": false
+    },
+    "payload": {
+        "headerId": null,
+        "timestamp": null,
+        "version": "2.0.0",
+        "manufacturer": null,
+        "serialNumber": null,
+        "responseOrderHeaderId": null,
+        "responseType": "ACCEPTED",
+        "actions": [],
+        "reason": ""
+    }
+}

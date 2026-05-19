@@ -1,0 +1,21 @@
+# Empty message_type returns all comm_manager MQTT JSON templates.
+# Otherwise return one template by message type, e.g. state, factsheet, connection.
+string message_type
+---
+bool success
+string message
+
+# JSON object:
+# {
+#   "baseTopic": "uagv/v2/WEGO/AMR-001",
+#   "templates": [
+#     {
+#       "messageType": "state",
+#       "topicSuffix": "state",
+#       "qos": 0,
+#       "retain": true,
+#       "payloadTemplate": {}
+#     }
+#   ]
+# }
+string templates_json

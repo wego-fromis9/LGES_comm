@@ -1,0 +1,17 @@
+{
+    "_meta": {
+        "topic_suffix": "visualization",
+        "qos": 0,
+        "retain": true
+    },
+    "payload": {
+        "headerId": null,
+        "timestamp": null,
+        "version": "2.0.0",
+        "manufacturer": null,
+        "serialNumber": null,
+        "referenceStateHeaderId": null,
+        "robotPosition": null,
+        "velocity": null
+    }
+}

@@ -1,0 +1,19 @@
+{
+    "_meta": {
+        "topic_suffix": "order",
+        "qos": 1,
+        "retain": false
+    },
+    "payload": {
+        "headerId": null,
+        "timestamp": null,
+        "version": "2.0.0",
+        "manufacturer": null,
+        "serialNumber": null,
+        "orderId": "",
+        "orderUpdateId": 1,
+        "orderType": "AUTO",
+        "recipeId": "",
+        "actions": []
+    }
+}
