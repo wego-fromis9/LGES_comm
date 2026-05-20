@@ -6,11 +6,41 @@ network:
 mqtt:
   broker_ip: 192.168.0.71
   port: 1883
+  client_id: AMR-001
+  clean_start: true
+  session_expiry_interval_sec: 0
+  keep_alive: 20
+  inbound_qos: 1
+  require_publish_ack: true
+  publish_ack_timeout_sec: 5
   max_retries: 10
   retry_interval: 5
+  reconnect_backoff:
+    min_delay_sec: 1
+    max_delay_sec: 30
+    multiplier: 1.5
   publish_connection_on_mqtt_connect: true
   manual_reconnect_delay: 2
-  disconnect_publish_wait_sec: 0.7
+  disconnect_publish_wait_sec: 1.0
+  lwt:
+    enabled: true
+    delay_interval_sec: 2
+    qos: 1
+    retain: true
+  retained:
+    clear_qos: 1
+    clear_on_connect: []
+    clear_on_normal_shutdown: []
+  auth:
+    username: ''
+    password: ''
+    password_env: ''
+  tls:
+    enabled: false
+    ca_certs: ''
+    certfile: ''
+    keyfile: ''
+    insecure: false
   timestamp:
     timezone: UTC
     use_z_suffix_for_utc: true
@@ -46,10 +76,16 @@ inbound:
         - actionDescription
       descriptor_fallback_field: ''
       descriptor_default: ''
+  order:
+    enabled: true
+    service: /recipe/run
+    timeout_sec: 0
+    sequence:
+      deduplicate: true
+      require_monotonic_update_id: true
   instant_actions:
     enabled: true
     service: /recipe/instant_action
-    factsheet_request_topic: /comm/request_factsheet
     default_input_json: '{}'
     action_id_source: route
     fail_fast: true
@@ -74,17 +110,52 @@ inbound:
         service: /recipe/instant_action
       request_factsheet:
         action_id: IA_REQUEST_FACTSHEET_001
-        mode: signal_ui
+        mode: publish_backend
   triggers:
     order: /comm/order_received
     instantActions: /comm/instant_actions_received
 outbound:
+  publisher_owner: backend
+  backend_publisher:
+    enabled: true
+    canonical_state_topic: /lges/state_json
+    recipe_query_service: /recipe/query_list
+    recipe_list_refresh_sec: 5
+    current_waypoint_max_age_sec: 3.5
+    derive_velocity_from_pose: false
+    publish_when_mqtt_disconnected: false
+    map_ver_no: 1
+    max_factsheet_nodes: 300
+    defaults:
+      control_state: MANUAL
+      operation_state: INIT
+      safety_state: NORMAL
+    topics:
+      mir_state: /mir/state
+      mir_errors: /mir/errors_json
+      mir_waypoints: /mir/waypoints_json
+      mir_current_waypoint: /mir/current_waypoint_json
+      system_safety_state: /system/safety_state
+      recipe_state: /recipe/state
+  state:
+    enabled: true
+    period_sec: 1
+  factsheet:
+    enabled: true
+    publish_on_start: true
+    publish_on_request: true
+    initial_delay_sec: 3
+    check_period_sec: 5
   visualization:
     enabled: false
+    period_sec: 1
+    clear_retained_when_disabled: true
 host_setup:
   ntp_client:
     enabled: true
     apply_on_comm_start: false
+    service_name: chrony
+    start_service_when_inactive: true
     server_from_mqtt_broker: false
     server: 192.168.0.71
     chrony_conf: /etc/chrony/chrony.conf
@@ -96,13 +167,12 @@ host_setup:
     monitor:
       enabled: true
       check_on_start: true
+      check_on_mqtt_connect: true
       check_interval_sec: 60
       run_makestep_on_start: true
+      run_makestep_on_mqtt_connect: true
+      run_makestep_on_manual_reconnect: true
       run_makestep_when_unsynchronised: false
       max_offset_sec: 1.0
       log_every_check: false
       command_timeout_sec: 5
-message_recording:
-  enabled: true
-  output_dir: ~/Documents/lges_mqtt_yaml
-  max_files_per_direction: 1000

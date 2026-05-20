@@ -1,0 +1,7 @@
+comm_integration_verifier:
+  comm_config_path: /home/wego/LGES_ws/src/comm_manager/config/config.yaml
+  start_comm_node: true
+  use_stub_recipe_services: true
+  scenario_timeout_sec: 12
+  lwt_wait_sec: 8
+  retained_visualization_probe: true

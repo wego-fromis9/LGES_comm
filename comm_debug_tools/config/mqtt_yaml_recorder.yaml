@@ -1,0 +1,8 @@
+mqtt_yaml_recorder:
+  enabled: true
+  config_path: /home/wego/LGES_ws/src/comm_manager/config/config.yaml
+  broker_ip: ''
+  port: null
+  topic: ''
+  output_dir: ~/Documents/lges_mqtt_yaml
+  max_files_per_day: 3000

@@ -1,6 +1,7 @@
 import re
 import subprocess
 import threading
+import os
 
 from .host_setup import apply_ntp_client, resolve_ntp_server
 
@@ -15,6 +16,8 @@ class NtpMonitor:
         self.stop_event = threading.Event()
         self.thread = None
         self.last_state = None
+        self.sync_lock = threading.Lock()
+        self.service_name = str(self.ntp_config.get("service_name", "chrony") or "chrony")
 
     def enabled(self):
         return bool(self.ntp_config.get("enabled", False)) and bool(self.monitor_config.get("enabled", False))
@@ -34,11 +37,12 @@ class NtpMonitor:
         if self.ntp_config.get("apply_on_comm_start", False):
             self.apply_host_setup()
 
-        if self.monitor_config.get("run_makestep_on_start", False):
-            self.run_makestep("startup")
-
-        if self.monitor_config.get("check_on_start", True):
-            self.check_once()
+        if self.monitor_config.get("run_makestep_on_start", False) or self.monitor_config.get("check_on_start", True):
+            self.sync_now(
+                "startup",
+                run_makestep=bool(self.monitor_config.get("run_makestep_on_start", False)),
+                check_after=bool(self.monitor_config.get("check_on_start", True)),
+            )
 
         interval = max(float(self.monitor_config.get("check_interval_sec", 60)), 1.0)
         while not self.stop_event.wait(interval):
@@ -51,6 +55,56 @@ class NtpMonitor:
             self.logger.warn(f"NTP host setup skipped: root permission required ({exc})")
         except Exception as exc:
             self.logger.warn(f"NTP host setup failed: {exc}")
+
+    def sync_now(self, reason, run_makestep=False, check_after=True):
+        if not self.enabled():
+            return
+        if not self.sync_lock.acquire(blocking=False):
+            self.logger.info(f"NTP sync already running; skip duplicate request ({reason}).")
+            return
+        try:
+            if not self.ensure_time_service(reason):
+                return
+            if run_makestep:
+                self.run_makestep(reason)
+            if check_after:
+                self.check_once()
+        finally:
+            self.sync_lock.release()
+
+    def ensure_time_service(self, reason):
+        if not self.ntp_config.get("start_service_when_inactive", True):
+            return True
+
+        result = self.run_command(["systemctl", "is-active", self.service_name])
+        state = (result.stdout or result.stderr or "").strip()
+        if result.returncode == 0 and state == "active":
+            return True
+
+        if os.geteuid() != 0:
+            self.log_state(
+                "service_inactive_no_root",
+                (
+                    f"NTP service '{self.service_name}' is not active ({state or 'unknown'}) during {reason}. "
+                    f"comm_node is not running as root, so it cannot start systemd services. "
+                    f"Run: sudo systemctl enable --now {self.service_name} && sudo chronyc -a makestep"
+                ),
+            )
+            return False
+
+        self.logger.warn(f"NTP service '{self.service_name}' is not active ({state or 'unknown'}); starting it.")
+        for command in (
+            ["timedatectl", "set-ntp", "true"],
+            ["systemctl", "enable", "--now", self.service_name],
+            ["systemctl", "restart", self.service_name],
+        ):
+            cmd_result = self.run_command(command)
+            if cmd_result.returncode != 0:
+                text = (cmd_result.stderr or cmd_result.stdout or "").strip()
+                self.log_state("service_start_failed", f"NTP service command failed ({' '.join(command)}): {text}")
+                return False
+
+        return True
 
     def run_command(self, command):
         timeout = float(self.monitor_config.get("command_timeout_sec", 5))

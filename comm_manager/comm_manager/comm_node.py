@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import fcntl
 import os
@@ -11,9 +12,8 @@ import signal
 import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
-from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from lges_recipe_interfaces.srv import SendInstantAction
+from lges_recipe_interfaces.srv import RunRecipe, SendInstantAction
 
 # 커스텀 인터페이스 로드
 from comm_interfaces.msg import ConnectionState
@@ -22,8 +22,9 @@ from comm_interfaces.srv import GetMqttJsonTemplates, PublishMqttJson, TriggerRe
 # 엔진(Core) 모듈 로드
 from .wifi_core import WifiCore
 from .mqtt_core import MqttCore
-from .task_handler import TaskHandler
+from .payload_validator import InboundPayloadValidator
 from .ntp_monitor import NtpMonitor
+from .backend_publisher import BackendMqttPublisher
 
 from ament_index_python.packages import get_package_share_directory
 
@@ -36,7 +37,7 @@ DEFAULT_INSTANT_ACTION_ROUTES = {
     "stop_charge": {"action_id": "IA_STOP_CHARGE_001"},
     "cancel_order": {"action_id": "IA_CANCEL_ORDER_001"},
     "clear_instant_actions": {"action_id": "IA_CLEAR_INSTANT_ACTIONS_001"},
-    "request_factsheet": {"action_id": "IA_REQUEST_FACTSHEET_001", "mode": "signal_ui"},
+    "request_factsheet": {"action_id": "IA_REQUEST_FACTSHEET_001", "mode": "publish_backend"},
 }
 
 def resolve_config_path():
@@ -106,8 +107,8 @@ class CommNode(Node):
         self.wifi_core = WifiCore(self.config, self.get_logger())
         self.mqtt_core = MqttCore(self.config, self.get_logger())
 
-        # [2-1] TaskHandler 초기화 (설정 없이 생성, 내부 기본값 사용)
-        self.task_handler = TaskHandler(logger=self.get_logger())
+        # [2-1] Host inbound payload 검증기 초기화. YAML 저장은 comm_debug_tools로 분리했다.
+        self.payload_validator = InboundPayloadValidator(logger=self.get_logger())
         
         # [3] MQTT 콜백 연결
         self.mqtt_core.on_connect_callback = self.on_mqtt_connect
@@ -140,6 +141,9 @@ class CommNode(Node):
         
         self.max_retries = self.config.get('mqtt', {}).get('max_retries', 5)
         self.retry_interval = self.config.get('mqtt', {}).get('retry_interval', 5)
+        self.reconnect_backoff_config = self.config.get('mqtt', {}).get('reconnect_backoff', {}) or {}
+        self.retry_backoff_multiplier = float(self.reconnect_backoff_config.get('multiplier', 1.5))
+        self.retry_interval_max = float(self.reconnect_backoff_config.get('max_delay_sec', max(float(self.retry_interval), 30.0)))
         self.manage_wifi = self.config.get('network', {}).get('manage_wifi', True)
         self.publish_connection_on_mqtt_connect = self.config.get('mqtt', {}).get('publish_connection_on_mqtt_connect', True)
         self.inbound_config = self.config.get('inbound', {})
@@ -149,16 +153,22 @@ class CommNode(Node):
         self.inbound_triggers = self.inbound_config.get('triggers', {}) or {}
         self.response_config = self.inbound_config.get('response', {}) or {}
         self.inbound_trigger_clients = self.create_inbound_trigger_clients()
+        self.order_config = self.inbound_config.get('order', {}) or {}
+        self.order_enabled = bool(self.order_config.get('enabled', True))
+        self.order_service_name = str(self.order_config.get('service', '/recipe/run'))
+        self.order_timeout_sec = float(self.order_config.get('timeout_sec', 0.0))
+        self.order_sequence_config = self.order_config.get('sequence', {}) or {}
+        self.order_require_monotonic_update_id = bool(
+            self.order_sequence_config.get('require_monotonic_update_id', True)
+        )
+        self.order_deduplicate = bool(self.order_sequence_config.get('deduplicate', True))
+        self.order_history = {}
+        self.order_client = self.create_client(RunRecipe, self.order_service_name)
         self.instant_action_config = self.inbound_config.get('instant_actions', {}) or {}
         self.instant_action_enabled = bool(self.instant_action_config.get('enabled', True))
         self.instant_action_service_name = str(
             self.instant_action_config.get('service', '/recipe/instant_action')
         )
-        self.factsheet_request_topic = str(
-            self.instant_action_config.get('factsheet_request_topic', '/comm/request_factsheet')
-            or '/comm/request_factsheet'
-        )
-        self.factsheet_request_pub = self.create_publisher(String, self.factsheet_request_topic, 10)
         self.instant_action_default_input_json = str(
             self.instant_action_config.get('default_input_json', '{}')
         )
@@ -172,6 +182,8 @@ class CommNode(Node):
         self.outbound_config = self.config.get('outbound', {}) or {}
         self.visualization_skip_logged = False
         self.visualization_retained_clear_sent = False
+        self.backend_publisher = BackendMqttPublisher(self, self.mqtt_core, self.config)
+        self.retained_policy_config = self.config.get('mqtt', {}).get('retained', {}) or {}
         self.ntp_monitor = NtpMonitor(self.config, self.config_path, self.get_logger())
         self.ntp_monitor.start()
         
@@ -233,13 +245,14 @@ class CommNode(Node):
 
         self.connection_thread = threading.Thread(
             target=self.connect_full_process,
+            kwargs={"reason": reason},
             daemon=True,
             name="comm-mqtt-connect"
         )
         self.connection_thread.start()
         return True
 
-    def connect_full_process(self):
+    def connect_full_process(self, reason=""):
         if self.is_shutting_down:
             return
 
@@ -249,6 +262,7 @@ class CommNode(Node):
 
         try:
             self.comm_state = "CONNECTING"
+            self.sync_time_for_connection(reason or "MQTT connect")
             
             if self.manage_wifi:
                 wifi_ok = self.wifi_core.connect_initial()
@@ -267,7 +281,12 @@ class CommNode(Node):
                     
                 retry_count += 1
                 if retry_count < self.max_retries and not self.is_shutting_down:
-                    time.sleep(self.retry_interval)
+                    delay = min(
+                        self.retry_interval_max,
+                        float(self.retry_interval) * (self.retry_backoff_multiplier ** max(retry_count - 1, 0))
+                    )
+                    self.get_logger().info(f"MQTT 재접속 backoff 대기: {delay:.1f}s")
+                    time.sleep(delay)
 
             if self.is_shutting_down:
                 return
@@ -276,6 +295,32 @@ class CommNode(Node):
             self.get_logger().fatal("최대 재시도 횟수 초과. 통신 영구 실패.")
         finally:
             self.connection_lock.release()
+
+    def sync_time_for_connection(self, reason):
+        if not hasattr(self, 'ntp_monitor') or not self.ntp_monitor:
+            return
+        if not self.ntp_monitor.enabled():
+            return
+
+        monitor_config = self.ntp_monitor.monitor_config
+        reason_text = str(reason or "").lower()
+        run_makestep = bool(monitor_config.get("run_makestep_on_mqtt_connect", False))
+        if "manual" in reason_text or "ui" in reason_text:
+            run_makestep = bool(monitor_config.get("run_makestep_on_manual_reconnect", run_makestep))
+
+        check_after = bool(monitor_config.get("check_on_mqtt_connect", True))
+        if not run_makestep and not check_after:
+            return
+
+        self.get_logger().info(
+            f"NTP sync check before MQTT connection ({reason}); "
+            f"makestep={'true' if run_makestep else 'false'}"
+        )
+        self.ntp_monitor.sync_now(
+            reason=f"mqtt_connection:{reason}",
+            run_makestep=run_makestep,
+            check_after=check_after,
+        )
 
     # ==========================================
     # [업그레이드 1] Graceful Shutdown (노드 종료 시 단절 알림)
@@ -302,7 +347,8 @@ class CommNode(Node):
             msg.signal_strength = self.signal_level
             self.state_pub.publish(msg)
             
-            # 2. MQTT (Host)로 OFFLINE 전송
+            # 2. 종료 정책에 따라 retained payload 정리 후 MQTT (Host)로 OFFLINE 전송
+            self.clear_retained_topics("clear_on_normal_shutdown")
             self.mqtt_core.disconnect(normal=True)
             
             # [핵심] 메시지가 실제로 네트워크로 나갈 수 있도록 아주 잠깐 대기
@@ -317,6 +363,22 @@ class CommNode(Node):
 
         # 3. 부모 클래스의 소멸자 호출
         super().destroy_node()
+
+    def clear_retained_topics(self, policy_key):
+        topics = self.retained_policy_config.get(policy_key, []) if isinstance(self.retained_policy_config, dict) else []
+        if isinstance(topics, str):
+            topics = [topics]
+        if not isinstance(topics, list):
+            return
+        qos = int(self.retained_policy_config.get('clear_qos', 1) or 0)
+        for topic_suffix in topics:
+            suffix = str(topic_suffix or '').strip().strip('/')
+            if not suffix:
+                continue
+            try:
+                self.mqtt_core.clear_retained(suffix, qos=qos)
+            except Exception as e:
+                self.get_logger().warn(f"Retained 삭제 실패 [{suffix}]: {e}")
 
     # ==========================================
     # ROS 2 ↔ UI 브릿지 역할
@@ -371,9 +433,136 @@ class CommNode(Node):
         return any(str(pattern).lower() in text for pattern in patterns)
 
     def call_inbound_route(self, message_type, payload):
+        if message_type == 'order' and self.order_enabled:
+            return self.call_order_service(payload)
         if message_type == 'instantActions' and self.instant_action_enabled:
             return self.call_instant_actions_service(payload)
         return self.call_inbound_trigger(message_type)
+
+    def run_recipe_result_reason(self, result, message):
+        response_type = str(getattr(result, 'response_type', '') or '').lower()
+        result_code = str(getattr(result, 'result_code', '') or '').lower()
+        if bool(getattr(result, 'accepted', False)):
+            return "service_accepted"
+        if response_type == "error" or self.classify_trigger_failure(f"{result_code} {message}"):
+            return "service_error"
+        return "service_rejected"
+
+    def call_order_service(self, payload):
+        sequence_ok, sequence_message, duplicate = self.validate_order_sequence(payload)
+        if not sequence_ok:
+            return False, sequence_message, "service_rejected"
+        if duplicate:
+            return True, sequence_message, "service_accepted"
+
+        if self.order_client is None:
+            return False, "order service is not configured", "service_not_configured"
+        if not self.order_client.wait_for_service(timeout_sec=self.inbound_service_wait_timeout_sec):
+            return False, f"service unavailable: {self.order_service_name}", "service_unavailable"
+
+        request = RunRecipe.Request()
+        request.execution_id = str(payload.get("executionId") or payload.get("execution_id") or "")
+        request.order_id = str(payload.get("orderId") or "")
+        request.order_update_id = int(payload.get("orderUpdateId") or 0)
+        request.order_type = str(payload.get("orderType") or "AUTO").upper()
+        request.recipe_id = str(payload.get("recipeId") or "")
+        request.input_json = json.dumps(payload, ensure_ascii=False)
+        request.timeout_sec = self.order_timeout_sec
+
+        self.get_logger().info(
+            "Order service call -> "
+            f"{self.order_service_name}: "
+            f"order_id={request.order_id}, update_id={request.order_update_id}, "
+            f"order_type={request.order_type}, recipe_id={request.recipe_id}"
+        )
+
+        done = threading.Event()
+        future = self.order_client.call_async(request)
+        future.add_done_callback(lambda _future: done.set())
+
+        if not done.wait(timeout=self.inbound_service_timeout_sec):
+            return False, f"service timeout: {self.order_service_name}", "service_timeout"
+
+        try:
+            result = future.result()
+        except Exception as e:
+            return False, f"service exception: {e}", "service_exception"
+
+        accepted = bool(getattr(result, 'accepted', False))
+        response_type = str(getattr(result, 'response_type', '') or '')
+        result_code = str(getattr(result, 'result_code', '') or '')
+        message = str(getattr(result, 'message', '') or '')
+        summary = f"{request.order_id}: {response_type or ('accepted' if accepted else 'rejected')}"
+        if result_code:
+            summary += f" ({result_code})"
+        if message:
+            summary += f" - {message}"
+        reason = self.run_recipe_result_reason(result, message)
+        if accepted:
+            self.remember_order(payload)
+        return accepted, summary, reason
+
+    def order_payload_hash(self, payload):
+        body = {
+            key: value
+            for key, value in (payload or {}).items()
+            if key not in ("headerId", "timestamp")
+        }
+        raw = json.dumps(body, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+    def validate_order_sequence(self, payload):
+        if not self.order_deduplicate and not self.order_require_monotonic_update_id:
+            return True, "", False
+
+        order_id = str(payload.get("orderId") or "").strip()
+        try:
+            update_id = int(payload.get("orderUpdateId"))
+        except (TypeError, ValueError):
+            return False, "invalid orderUpdateId: must be an integer", False
+
+        if not order_id:
+            return False, "invalid orderId: must not be empty", False
+        if update_id < 0:
+            return False, "invalid orderUpdateId: must be >= 0", False
+
+        previous = self.order_history.get(order_id)
+        if not previous:
+            return True, "", False
+
+        previous_update_id = int(previous.get("orderUpdateId", -1))
+        payload_hash = self.order_payload_hash(payload)
+        previous_hash = previous.get("payloadHash")
+
+        if update_id == previous_update_id:
+            if self.order_deduplicate and payload_hash == previous_hash:
+                return True, f"duplicate order ignored: orderId={order_id}, orderUpdateId={update_id}", True
+            return False, (
+                f"non-monotonic orderUpdateId: orderId={order_id}, "
+                f"received={update_id}, previous={previous_update_id}"
+            ), False
+
+        if self.order_require_monotonic_update_id and update_id < previous_update_id:
+            return False, (
+                f"non-monotonic orderUpdateId: orderId={order_id}, "
+                f"received={update_id}, previous={previous_update_id}"
+            ), False
+
+        return True, "", False
+
+    def remember_order(self, payload):
+        order_id = str(payload.get("orderId") or "").strip()
+        if not order_id:
+            return
+        try:
+            update_id = int(payload.get("orderUpdateId"))
+        except (TypeError, ValueError):
+            return
+        self.order_history[order_id] = {
+            "orderUpdateId": update_id,
+            "payloadHash": self.order_payload_hash(payload),
+            "rememberedAt": time.time(),
+        }
 
     def normalize_instant_action_routes(self, routes_config):
         routes = {}
@@ -458,7 +647,7 @@ class CommNode(Node):
         if action_type not in self.instant_action_routes:
             return False, f"unsupported instant action type: {action_type}", "service_rejected"
         route_mode = str(route.get("mode") or "").strip().lower()
-        if action_type == "request_factsheet" or route_mode in ("signal_ui", "publish_factsheet"):
+        if action_type == "request_factsheet" or route_mode in ("publish_backend", "publish_factsheet"):
             return self.handle_request_factsheet(action, source_action_id, action_id, action_type)
 
         client = self.get_instant_action_client(service_name)
@@ -508,27 +697,18 @@ class CommNode(Node):
         return accepted, summary, self.instant_action_result_reason(result, message)
 
     def handle_request_factsheet(self, action, source_action_id, mapped_action_id, action_type):
-        try:
-            request_payload = {
-                "actionId": source_action_id,
-                "mappedActionId": mapped_action_id,
-                "actionType": action_type,
-                "timestamp": self.mqtt_core.current_timestamp(),
-                "source": "mqtt.instantActions",
-                "action": action,
-            }
-            msg = String()
-            msg.data = json.dumps(request_payload, ensure_ascii=False)
-            self.factsheet_request_pub.publish(msg)
-            self.get_logger().info(
-                f"Factsheet request signalled -> {self.factsheet_request_topic}: {msg.data}"
-            )
-            return True, (
-                f"{mapped_action_id}/{action_type}: factsheet request signalled "
-                f"({self.factsheet_request_topic})"
-            ), "service_accepted"
-        except Exception as e:
-            return False, f"{mapped_action_id}/{action_type}: factsheet request signal failed: {e}", "service_error"
+        if not self.backend_publisher or not self.backend_publisher.can_publish_factsheet():
+            return False, "backend factsheet publisher is not enabled", "service_not_configured"
+
+        success, message = self.backend_publisher.publish_factsheet(
+            force=True,
+            reason=f"{mapped_action_id}/{action_type}",
+        )
+        return (
+            success,
+            message if message else f"{mapped_action_id}/{action_type}: factsheet published",
+            "service_accepted" if success else "service_error",
+        )
 
     def call_instant_actions_service(self, payload):
         actions = payload.get("instantActions") if isinstance(payload, dict) else None
@@ -797,10 +977,11 @@ class CommNode(Node):
             self.comm_state = "CONNECTED"
             self.get_logger().info("▶ [3] MQTT 접속 성공.")
             
-            # 네트워크 연결 상태는 comm_node가 소유한다.
-            # factsheet/state/visualization payload는 UI가 서비스로 요청한다.
+            # Host MQTT interface는 comm_node/backend가 소유한다.
+            # UI는 표시/조작과 수동 publish 진단 경로만 유지한다.
             if self.publish_connection_on_mqtt_connect:
                 self.mqtt_core.publish_by_template('connection', connectionState="CONNECTED")
+            self.clear_retained_topics("clear_on_connect")
             self.clear_visualization_retained_if_disabled()
         else:
             self.get_logger().error(f"MQTT 접속 거부 (코드: {rc})")
@@ -822,7 +1003,7 @@ class CommNode(Node):
             self.start_connection_thread("MQTT disconnect")
 
     def on_mqtt_message(self, topic, payload):
-        """MQTT 메시지 수신 콜백. Order / InstantActions 는 TaskHandler 로 위임."""
+        """MQTT 메시지 수신 콜백. Order / InstantActions 를 검증하고 실제 ROS route로 위임."""
         self.get_logger().info(f"Host 명령 수신 [{topic}]: {payload}")
 
         message_type = self.inbound_message_type_from_topic(topic)
@@ -842,10 +1023,10 @@ class CommNode(Node):
             )
             return
 
-        save_success, save_message, parsed_payload = self.task_handler.process_and_save_result(topic, payload)
-        if not save_success:
-            message = save_message or f"invalid {message_type} format"
-            self.get_logger().error(f"[TaskHandler] 처리 실패: {message}")
+        valid, validation_message, parsed_payload = self.payload_validator.process_result(topic, payload)
+        if not valid:
+            message = validation_message or f"invalid {message_type} format"
+            self.get_logger().error(f"[InboundValidator] 처리 실패: {message}")
             self.publish_inbound_response(
                 message_type,
                 False,
@@ -857,7 +1038,7 @@ class CommNode(Node):
             )
             return
 
-        self.get_logger().info("[TaskHandler] 처리 완료 → YAML 저장됨")
+        self.get_logger().info("[InboundValidator] 처리 완료")
         trigger_success, trigger_message, trigger_reason = self.call_inbound_route(message_type, payload)
         self.get_logger().info(
             f"Inbound trigger result [{message_type}]: "

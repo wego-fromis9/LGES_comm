@@ -1,14 +1,16 @@
 import json
 import os
+import ssl
 import time
 import threading
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import paho.mqtt.client as mqtt
+from paho.mqtt.packettypes import PacketTypes
+from paho.mqtt.properties import Properties
 
 from ament_index_python.packages import get_package_share_directory
-from .message_recorder import MessageRecorder
 
 class MqttCore:
     def __init__(self, config, logger):
@@ -23,6 +25,12 @@ class MqttCore:
         self.broker_ip = self.mqtt_config.get('broker_ip', '127.0.0.1')
         self.port = self.mqtt_config.get('port', 1883)
         self.keep_alive = self.mqtt_config.get('keep_alive', 20)
+        self.client_id = self.mqtt_config.get('client_id') or self.serial_number
+        self.require_publish_ack = bool(self.mqtt_config.get('require_publish_ack', True))
+        self.publish_ack_timeout_sec = float(self.mqtt_config.get('publish_ack_timeout_sec', 5.0))
+        self.inbound_qos = int(self.mqtt_config.get('inbound_qos', 1))
+        self.session_expiry_interval_sec = int(self.mqtt_config.get('session_expiry_interval_sec', 0))
+        self.clean_start = bool(self.mqtt_config.get('clean_start', True))
         self.version = self.robot_config.get('version', '2.0.0')
         self.timestamp_config = self.mqtt_config.get('timestamp', {}) or {}
         if not isinstance(self.timestamp_config, dict):
@@ -36,7 +44,6 @@ class MqttCore:
         self.connected = False
         self.loop_started = False
         self.connection_lock = threading.Lock()
-        self.recorder = MessageRecorder(config, logger)
         
         # 템플릿 폴더 경로 설정 (ROS 2 share 디렉토리에서 동적으로 가져옴)
         try:
@@ -46,7 +53,9 @@ class MqttCore:
             self.logger.error(f"템플릿 경로를 찾을 수 없습니다: {e}")
             self.template_dir = ""
         
-        self.client = mqtt.Client(client_id=self.serial_number, protocol=mqtt.MQTTv5)
+        self.client = mqtt.Client(client_id=self.client_id, protocol=mqtt.MQTTv5)
+        self._setup_auth_tls()
+        self._setup_reconnect_backoff()
         
         # ... (이하 기존 코드와 완벽히 동일)
         self.on_connect_callback = None
@@ -59,12 +68,72 @@ class MqttCore:
 
         self._setup_lwt()
 
+    def _setup_auth_tls(self):
+        auth = self.mqtt_config.get('auth', {}) or {}
+        username = auth.get('username')
+        password = auth.get('password')
+        password_env = auth.get('password_env')
+        if password_env:
+            password = os.environ.get(str(password_env), password)
+        if username:
+            self.client.username_pw_set(str(username), None if password is None else str(password))
+
+        tls = self.mqtt_config.get('tls', {}) or {}
+        if not bool(tls.get('enabled', False)):
+            return
+
+        ca_certs = tls.get('ca_certs') or tls.get('ca_cert')
+        certfile = tls.get('certfile') or tls.get('cert_file')
+        keyfile = tls.get('keyfile') or tls.get('key_file')
+        cert_reqs = ssl.CERT_NONE if bool(tls.get('insecure', False)) else ssl.CERT_REQUIRED
+        self.client.tls_set(
+            ca_certs=os.path.expanduser(ca_certs) if ca_certs else None,
+            certfile=os.path.expanduser(certfile) if certfile else None,
+            keyfile=os.path.expanduser(keyfile) if keyfile else None,
+            cert_reqs=cert_reqs,
+            tls_version=ssl.PROTOCOL_TLS_CLIENT,
+        )
+        if bool(tls.get('insecure', False)):
+            self.client.tls_insecure_set(True)
+
+    def _setup_reconnect_backoff(self):
+        backoff = self.mqtt_config.get('reconnect_backoff', {}) or {}
+        min_delay = float(backoff.get('min_delay_sec', 1.0))
+        max_delay = float(backoff.get('max_delay_sec', 30.0))
+        try:
+            self.client.reconnect_delay_set(min_delay=min_delay, max_delay=max_delay)
+        except Exception as e:
+            self.logger.warn(f"MQTT reconnect delay 설정 실패: {e}")
+
+    def _connect_properties(self):
+        props = Properties(PacketTypes.CONNECT)
+        props.SessionExpiryInterval = self.session_expiry_interval_sec
+        return props
+
+    def _will_properties(self):
+        lwt_config = self.mqtt_config.get('lwt', {}) or {}
+        delay = int(lwt_config.get('delay_interval_sec', 0) or 0)
+        if delay <= 0:
+            return None
+        props = Properties(PacketTypes.WILLMESSAGE)
+        props.WillDelayInterval = delay
+        return props
+
     def _setup_lwt(self):
         """LWT(유언장)도 템플릿을 읽어서 동적으로 생성합니다."""
+        lwt_config = self.mqtt_config.get('lwt', {}) or {}
+        if not bool(lwt_config.get('enabled', True)):
+            return
         lwt_payload, meta = self._build_from_template('connection', connectionState="DISCONNECTED")
         if lwt_payload and meta:
             lwt_topic = f"{self.base_topic}/{meta['topic_suffix']}"
-            self.client.will_set(topic=lwt_topic, payload=json.dumps(lwt_payload), qos=meta['qos'], retain=meta['retain'])
+            self.client.will_set(
+                topic=lwt_topic,
+                payload=json.dumps(lwt_payload),
+                qos=int(lwt_config.get('qos', meta['qos'])),
+                retain=bool(lwt_config.get('retain', meta['retain'])),
+                properties=self._will_properties()
+            )
 
     def connect(self):
         with self.connection_lock:
@@ -75,7 +144,16 @@ class MqttCore:
                 if self.loop_started:
                     self.client.reconnect()
                 else:
-                    self.client.connect(self.broker_ip, self.port, self.keep_alive)
+                    try:
+                        self.client.connect(
+                            self.broker_ip,
+                            self.port,
+                            self.keep_alive,
+                            clean_start=self.clean_start,
+                            properties=self._connect_properties()
+                        )
+                    except TypeError:
+                        self.client.connect(self.broker_ip, self.port, self.keep_alive)
                     self.client.loop_start()
                     self.loop_started = True
                 return True
@@ -115,8 +193,8 @@ class MqttCore:
         # Host(관제 시스템) → 로봇 방향의 명령 토픽 구독
         # '+' 와일드카드: manufacturer, serial_number 값에 무관하게 수신
         if rc == 0:
-            client.subscribe(f"{self.base_topic}/order")
-            client.subscribe(f"{self.base_topic}/instantActions")
+            client.subscribe(f"{self.base_topic}/order", qos=self.inbound_qos)
+            client.subscribe(f"{self.base_topic}/instantActions", qos=self.inbound_qos)
             self.logger.info(
                 f"MQTT 명령 구독 완료: "
                 f"[{self.base_topic}/order], "
@@ -132,22 +210,22 @@ class MqttCore:
         if self.on_message_callback:
             try:
                 payload = json.loads(msg.payload.decode('utf-8'))
-                self.recorder.record(
-                    'received_from_host',
-                    str(msg.topic or '').rstrip('/').split('/')[-1],
-                    msg.topic,
-                    payload,
-                    qos=getattr(msg, 'qos', None),
-                    retain=getattr(msg, 'retain', None)
-                )
-                self.on_message_callback(msg.topic, payload)
+                self._dispatch_message_callback(msg.topic, payload)
             except json.JSONDecodeError:
                 raw_payload = msg.payload.decode('utf-8', errors='replace')
                 error_message = f"invalid JSON format: {raw_payload}"
                 self.logger.warn(f"JSON 파싱 실패 (토픽: {msg.topic})")
-                self.on_message_callback(msg.topic, {
+                self._dispatch_message_callback(msg.topic, {
                     "_comm_parse_error": error_message
                 })
+
+    def _dispatch_message_callback(self, topic, payload):
+        threading.Thread(
+            target=self.on_message_callback,
+            args=(topic, payload),
+            daemon=True,
+            name=f"mqtt-message-{str(topic).rstrip('/').split('/')[-1] or 'payload'}"
+        ).start()
 
     def _resolve_timestamp_timezone(self):
         configured = str(self.timestamp_config.get('timezone', 'UTC') or 'UTC').strip()
@@ -293,14 +371,7 @@ class MqttCore:
 
         topic = f"{self.base_topic}/{topic_suffix}"
         info = self.client.publish(topic, payload=b"", qos=int(qos), retain=True)
-        self.recorder.record(
-            'sent_to_host',
-            f"{topic_suffix}_retained_clear",
-            topic,
-            None,
-            qos=int(qos),
-            retain=True
-        )
+        self._wait_for_publish_ack(info, topic, int(qos))
         self.logger.info(f"MQTT retained 삭제 발행 완료 [{topic}] (QoS:{qos})")
         return {
             "topic": topic,
@@ -337,14 +408,7 @@ class MqttCore:
             qos=int(qos_value),
             retain=bool(retain_value)
         )
-        self.recorder.record(
-            'sent_to_host',
-            topic_suffix,
-            topic,
-            built_payload,
-            qos=int(qos_value),
-            retain=bool(retain_value)
-        )
+        self._wait_for_publish_ack(info, topic, int(qos_value))
         self.logger.info(f"MQTT 발행 완료 [{topic}] (QoS:{qos_value}, Retain:{retain_value})")
         return {
             "topic": topic,
@@ -353,3 +417,22 @@ class MqttCore:
             "retain": bool(retain_value),
             "mid": getattr(info, "mid", 0)
         }
+
+    def _wait_for_publish_ack(self, info, topic, qos):
+        if not self.require_publish_ack or qos <= 0:
+            return
+        thread_name = threading.current_thread().name.lower()
+        if "paho-mqtt-client" in thread_name or thread_name.startswith("paho"):
+            self.logger.debug(f"MQTT publish ack 대기 생략(콜백 스레드): {topic}")
+            return
+        try:
+            info.wait_for_publish(timeout=self.publish_ack_timeout_sec)
+        except RuntimeError as exc:
+            raise TimeoutError(f"MQTT publish ack timeout: {topic}") from exc
+
+        if hasattr(info, 'is_published') and not info.is_published():
+            raise TimeoutError(f"MQTT publish ack timeout: {topic}")
+
+        rc = getattr(info, 'rc', mqtt.MQTT_ERR_SUCCESS)
+        if rc != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError(f"MQTT publish failed: topic={topic}, rc={rc}")

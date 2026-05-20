@@ -6,22 +6,15 @@ import yaml
 
 
 class MessageRecorder:
-    """Persist MQTT payloads as YAML for pre-integration review."""
+    """Persist MQTT payloads as YAML for integration/debug review."""
 
-    def __init__(self, config, logger=None):
-        cfg = (config or {}).get('message_recording', {}) or {}
+    def __init__(self, output_dir='~/Documents/lges_mqtt_yaml', max_files_per_day=3000, logger=None):
+        self.output_dir = os.path.expanduser(output_dir)
+        self.max_files_per_day = int(max_files_per_day or 0)
         self.logger = logger
-        self.enabled = bool(cfg.get('enabled', True))
-        self.output_dir = os.path.expanduser(
-            cfg.get('output_dir', '~/Documents/lges_mqtt_yaml')
-        )
-        self.max_files_per_direction = int(cfg.get('max_files_per_direction', 1000))
 
     def record(self, direction, message_type, topic, payload, qos=None, retain=None):
-        if not self.enabled:
-            return ''
-
-        direction = self._safe_name(direction or 'unknown')
+        direction = self._safe_name(direction or 'mqtt')
         message_type = self._safe_name(message_type or self._message_type_from_topic(topic))
         now = datetime.now(timezone.utc)
         date_dir = os.path.join(self.output_dir, now.strftime('%Y%m%d'), direction)
@@ -56,7 +49,7 @@ class MessageRecorder:
         return path
 
     def _cleanup(self, directory):
-        if self.max_files_per_direction <= 0:
+        if self.max_files_per_day <= 0:
             return
         try:
             files = [
@@ -64,7 +57,7 @@ class MessageRecorder:
                 for name in os.listdir(directory)
                 if name.endswith(('.yaml', '.yml'))
             ]
-            overflow = len(files) - self.max_files_per_direction
+            overflow = len(files) - self.max_files_per_day
             if overflow <= 0:
                 return
             files.sort(key=lambda item: os.path.getmtime(item))
