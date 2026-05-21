@@ -251,7 +251,7 @@ class MqttCore:
         lwt_config = self.lwt_config
         if not bool(lwt_config.get('enabled', True)):
             return
-        lwt_payload, meta = self._build_from_template('connection', connectionState="DISCONNECTED")
+        lwt_payload, meta = self._build_from_template('connection', connectionState="CONNECTED BROKEN")
         if lwt_payload and meta:
             lwt_topic = f"{self.base_topic}/{meta['topic_suffix']}"
             kwargs = {
