@@ -31,6 +31,25 @@ class InboundPayloadValidator:
             return self._fail(f"invalid payload format: missing required keys {missing}", "warn")
         return True
 
+    def _normalize_action_type(self, value, allowed_action_types):
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return ""
+        if raw in allowed_action_types:
+            return raw
+        compact = "".join(raw.split())
+        if compact in allowed_action_types:
+            return compact
+        for action_type in allowed_action_types:
+            compact_action_type = action_type.replace("_", "")
+            if compact == action_type + action_type:
+                return action_type
+            if compact == compact_action_type:
+                return action_type
+            if compact == compact_action_type + compact_action_type:
+                return action_type
+        return raw
+
     def _validate_order(self, data):
         required = [
             "headerId",
@@ -106,7 +125,7 @@ class InboundPayloadValidator:
             ]
             if missing:
                 return self._fail(f"invalid instantActions format: instantActions[{index}] missing required keys {missing}", "warn")
-            action_type = str(action.get("actionType") or "").strip()
+            action_type = self._normalize_action_type(action.get("actionType"), allowed_action_types)
             if action_type and action_type not in allowed_action_types:
                 return self._fail(f"invalid instantActions format: unsupported actionType {action_type}", "warn")
         return True

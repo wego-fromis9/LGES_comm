@@ -1,0 +1,26 @@
+messages:
+  instantActions:
+    direction: inbound
+    source_owner: broker_or_host
+    routing:
+      handler: comm_manager.inbound_handler.call_instant_action_service
+      default_service: /recipe/instant_action
+      srv_type: lges_recipe_interfaces/srv/SendInstantAction
+      config_path: inbound.instant_actions
+      notes:
+        - This MQTT payload is received from the broker/host.
+        - It is not populated from ROS topics.
+        - Supported actionType values are managed under inbound.instant_actions.routes.
+        - request_factsheet is handled internally by publishing the backend factsheet.
+    meta:
+      topic_suffix: instantActions
+      qos: 1
+      retain: false
+    payload:
+      instantActions: []
+    fields:
+      instantActions:
+        type: array
+        item_type: object
+        item_required_fields: [actionId, actionType]
+        item_optional_fields: [blockingType, inputJson, input_json, actionParams]

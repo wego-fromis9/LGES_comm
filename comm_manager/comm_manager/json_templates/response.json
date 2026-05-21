@@ -10,7 +10,8 @@
         "version": "2.0.0",
         "manufacturer": null,
         "serialNumber": null,
-        "responseOrderHeaderId": null,
+        "orderId": null,
+        "instantActionFlag": false,
         "responseType": "ACCEPTED",
         "actions": [],
         "reason": ""

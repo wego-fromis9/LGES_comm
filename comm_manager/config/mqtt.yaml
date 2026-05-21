@@ -1,0 +1,81 @@
+mqtt:
+  broker_ip: 192.168.0.71
+  port: 1883
+  client_id: AMR-001
+  # Use mqttv311 when the broker has MQTT v5 CONNACK/property compatibility issues.
+  # MQTT v5 is required for client-side Will Delay Interval.
+  protocol: mqttv311
+  clean_start: true
+  session_expiry_interval_sec: 0
+
+  # MQTT topic common prefix. Available placeholders:
+  # {manufacturer}, {serialNumber}, {serial_number}, {version}
+  topic:
+    base: oc/pack5/{manufacturer}/{serialNumber}
+
+  # Common JSON header. These five fields are injected into every MQTT payload.
+  header:
+    version: 2.0.0
+    manufacturer: WEGO
+    serialNumber: AMR-001
+    fields:
+      headerId:
+        source: counter
+      timestamp:
+        source: timestamp
+      version:
+        value: 2.0.0
+      manufacturer:
+        value: WEGO
+      serialNumber:
+        value: AMR-001
+
+  # MQTT protocol-level heartbeat. Paho sends PINGREQ/PINGRESP when no MQTT
+  # packet is exchanged before this interval. State publish traffic also counts.
+  keep_alive: 20
+  keep_alive_policy:
+    detection_threshold_multiplier: 1.5
+    lwt_grace_delay_sec: 5
+
+  inbound_qos: 1
+  require_publish_ack: true
+  publish_ack_timeout_sec: 5
+  payload:
+    # false keeps null-valued fields in outgoing JSON so missing ROS data is visible.
+    prune_nulls: false
+  max_retries: 10
+  retry_interval: 5
+  reconnect_backoff:
+    min_delay_sec: 1
+    max_delay_sec: 30
+    multiplier: 1.5
+  publish_connection_on_mqtt_connect: true
+  manual_reconnect_delay: 2
+  disconnect_publish_wait_sec: 1.0
+
+  lwt:
+    enabled: true
+    delay_interval_sec: 5
+    qos: 1
+    retain: true
+
+  retained:
+    clear_qos: 1
+    clear_on_connect: []
+    clear_on_normal_shutdown: []
+
+  auth:
+    username: ''
+    password: ''
+    password_env: ''
+
+  tls:
+    enabled: false
+    ca_certs: ''
+    certfile: ''
+    keyfile: ''
+    insecure: false
+
+  timestamp:
+    timezone: UTC
+    use_z_suffix_for_utc: true

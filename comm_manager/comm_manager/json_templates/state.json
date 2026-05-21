@@ -14,7 +14,13 @@
         "orderUpdateId": null,
         "lastNodeId": null,
         "lastNodeSeqNo": null,
+        "lastActionId": null,
+        "lastActionSequenceId": null,
+        "currentActionState": null,
+        "currentNodeId": null,
         "nodeStates": [],
+        "loads": [],
+        "paused": false,
         "actionStates": [],
         "instantActionStates": [],
         "robotPosition": null,
@@ -31,6 +37,7 @@
         "controlState": null,
         "operationState": null,
         "safetyState": null,
+        "safetyStatus": null,
         "errors": []
     }
 }

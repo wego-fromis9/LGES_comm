@@ -1,0 +1,21 @@
+messages:
+  sync:
+    direction: inbound_broker_time
+    source_owner: broker_or_host
+    routing:
+      handler: comm_manager.mqtt_core.handle_broker_time_payload
+      config_path: time_sync.broker_topic
+      notes:
+        - Broker sends this payload after robot connection.
+        - comm_manager reads the header timestamp and applies OS time if configured.
+    meta:
+      topic_suffix: sync
+      qos: 1
+      retain: false
+    payload: {}
+    fields:
+      timestamp:
+        type: string
+        source: mqtt_header
+        field_path: timestamp
+        description: Broker reference timestamp used for UI PC OS time sync.

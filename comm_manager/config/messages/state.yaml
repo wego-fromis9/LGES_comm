@@ -1,0 +1,329 @@
+messages:
+  state:
+    direction: outbound
+    source_owner: comm_manager.backend_publisher
+    meta:
+      topic_suffix: state
+      qos: 0
+      retain: true
+    payload:
+      orderId: null
+      orderUpdateId: null
+      lastNodeId: null
+      lastNodeSeqNo: null
+      lastActionId: null
+      lastActionSequenceId: null
+      currentActionState: null
+      currentNodeId: null
+      nodeStates: []
+      loads: []
+      paused: false
+      actionStates: []
+      instantActionStates: []
+      robotPosition: null
+      velocity: null
+      driving: false
+      batteryState:
+        batteryCharge: null
+        batteryVoltage: null
+        batteryCurrent: null
+        batteryHealth: null
+        charging: false
+        reach: null
+      controlState: null
+      operationState: null
+      safetyState: null
+      safetyStatus: null
+      errors: []
+    fields:
+      orderId:
+        type: string
+        source: ros_topic
+        ros_topic: /recipe/state
+        ros_type: lges_recipe_interfaces/msg/RecipeExecutionState
+        field_path: order_id
+        transform: empty_to_null
+        empty_value: null
+      orderUpdateId:
+        type: integer
+        only_when: orderId is available
+        source: ros_topic
+        ros_topic: /recipe/state
+        ros_type: lges_recipe_interfaces/msg/RecipeExecutionState
+        field_path: order_update_id
+        empty_value: null
+      lastNodeId:
+        type: string
+        source: derived
+        rule: latest reached waypoint nodeId from /mir/reached_waypoint_json history, otherwise null
+        empty_value: null
+      lastNodeSeqNo:
+        type: integer
+        source: derived
+        rule: latest reached waypoint traversal sequence from nodeStates, otherwise null
+        empty_value: null
+      lastActionId:
+        type: string
+        source: derived
+        rule: current recipe step id, otherwise null
+        empty_value: null
+      lastActionSequenceId:
+        type: integer
+        source: derived
+        rule: current recipe step index, otherwise null
+        empty_value: null
+      currentActionState:
+        type: object
+        source: builder
+        builder: build_current_action_state
+        rule: current recipe action as actionId/actionType/actionStatus/actionResult, otherwise null
+        empty_value: null
+      currentNodeId:
+        type: string
+        source_priority:
+          - source: ros_topic
+            ros_topic: /mir/current_waypoint_json
+            ros_type: std_msgs/msg/String
+            payload_format: json
+            candidate_paths: [name, guid, id]
+            transform: topic_safe_id
+            max_age_sec_config: outbound.backend_publisher.current_waypoint_max_age_sec
+            null_when_same_as_last_reached: true
+        max_age_sec_config: outbound.backend_publisher.current_waypoint_max_age_sec
+        empty_value: null
+      nodeStates:
+        type: array
+        source: builder
+        builder: build_reached_node_states
+        inputs:
+          - /mir/reached_waypoint_json
+        item_mapping:
+          nodeId: nodeId
+          sequenceId: sequenceId
+        notes:
+          - Contains reached waypoint history only.
+          - /mir/nearest_waypoint_json is intentionally not used.
+        empty_value: []
+      robotPosition:
+        type: object
+        source: ros_topic
+        ros_topic: /mir/state
+        ros_type: std_msgs/msg/String
+        payload_format: json
+        object_fields:
+          x:
+            field_path: position.x
+            transform: round_3
+          y:
+            field_path: position.y
+            transform: round_3
+          theta:
+            field_path: position.orientation
+            transform: degrees_to_radians_round_3
+        required_fields: [x, y]
+        empty_value: null
+      velocity:
+        type: object
+        source: ros_topic
+        ros_topic: /mir/state
+        ros_type: std_msgs/msg/String
+        payload_format: json
+        object_fields:
+          vx:
+            field_path: velocity.linear
+            transform: number_or_null
+          vy:
+            source: not_available
+            empty_value: null
+          omega:
+            field_path: velocity.angular
+            transform: number_or_null
+        required_fields: [vx, omega]
+        empty_value: null
+      driving:
+        type: bool
+        source: derived
+        rule: mir_state_text_in_list
+        ros_topic: /mir/state
+        ros_type: std_msgs/msg/String
+        payload_format: json
+        field_path: state_text
+        # MiR examples seen/expected in this project:
+        # - driving-like: Executing
+        # - non-driving: Ready, Pause, EmergencyStop, ManualControl, Error
+        true_when_text_contains: [executing, moving, running]
+        empty_value: false
+      paused:
+        type: boolean
+        source: derived
+        rule: configurable /system/safety_state pause mapping
+        ros_topic: /system/safety_state
+        ros_type: std_msgs/msg/String
+        payload_format: json_or_text
+        state_field_path: state
+        pause_requested_field_path: pause_requested
+        true_when_states: [pause, estop]
+        true_when_pause_requested: true
+        empty_value: false
+      loads:
+        type: array
+        source: not_available
+        reason: No current ROS topic exposes load/LOT/RFID state.
+        empty_value: []
+      actionStates:
+        type: array
+        source: builder
+        builder: build_action_states
+        inputs:
+          - /recipe/state
+          - /recipe/query_list
+          - operationState
+        notes:
+          - Uses active recipe step when /recipe/state.current_step_id is set.
+          - Contains processed inbound order history as flat action state objects.
+        empty_value: []
+      instantActionStates:
+        type: array
+        source: builder
+        builder: build_instant_action_states
+        notes:
+          - Contains processed inbound instantAction history as flat action state objects.
+        empty_value: []
+      batteryState:
+        type: object
+        source: ros_topic
+        ros_topic: /mir/state
+        ros_type: std_msgs/msg/String
+        payload_format: json
+        object_fields:
+          batteryCharge:
+            field_path: battery_percentage
+            transform: round_1
+          batteryVoltage:
+            source: not_available
+            empty_value: null
+          batteryCurrent:
+            source: not_available
+            empty_value: null
+          batteryHealth:
+            source: not_available
+            empty_value: null
+          charging:
+            source: derived
+            candidate_paths: [state_text, mission_text, mode_text]
+            true_when_text_contains: [charge, charging, chg]
+          reach:
+            field_path: battery_time_remaining
+            transform: number_or_null
+      controlState:
+        type: enum
+        # allowed: [OFFLINE, NORMAL, AUTO, ABORT]
+        # source: ros_topic
+        # ros_topic: /system/safety_state
+        # ros_type: std_msgs/msg/String
+        # payload_format: json_or_text
+        # candidate_paths: [state]
+        # empty_value: null
+        source: config
+        value: AUTO
+        reason: Temporary forced value for customer test
+      operationState:
+        type: enum
+        allowed: [INIT, IDLE, ACTIVE, PAUSED, CHARGING, ERROR, EMO]
+        source_priority:
+          - source: ros_topic
+            ros_topic: /recipe/state
+            ros_type: lges_recipe_interfaces/msg/RecipeExecutionState
+            field_path: operation_state
+          - source: derived
+            ros_topic: /mir/state
+            candidate_paths: [state_text, state, mission_text, mode_text, errors]
+        transform: normalize_operation_state
+        empty_value: null
+      safetyState:
+        type: boolean
+        source: ros_topic
+        ros_topic: /system/safety_state
+        ros_type: std_msgs/msg/String
+        payload_format: json_or_text
+        field_path: active
+        empty_value: null
+      safetyStatus:
+        type: object
+        source: ros_topic
+        ros_topic: /system/safety_state
+        ros_type: std_msgs/msg/String
+        payload_format: json_or_text
+        object_fields:
+          state:
+            field_path: state
+            empty_value: null
+          active:
+            field_path: active
+            empty_value: false
+          source:
+            field_path: source
+            empty_value: null
+          reason:
+            field_path: reason
+            empty_value: null
+          recoverable:
+            field_path: recoverable
+            empty_value: null
+          requiresManualReset:
+            field_path: requires_manual_reset
+            empty_value: null
+          timeoutServices:
+            field_path: timeout_services
+            empty_value: null
+          activeEstopSources:
+            field_path: active_estop_sources
+            empty_value: []
+          activeInterlockSources:
+            field_path: active_interlock_sources
+            empty_value: []
+          pauseRequested:
+            field_path: pause_requested
+            empty_value: false
+          pauseSource:
+            field_path: pause_source
+            empty_value: null
+          activeErrorSources:
+            field_path: active_error_sources
+            empty_value: []
+          manualResetSources:
+            field_path: manual_reset_sources
+            empty_value: []
+          stamp:
+            field_path: stamp
+            empty_value: null
+        required_fields: [state]
+        empty_value: null
+      errors:
+        type: array
+        source_priority:
+          - source: ros_topic
+            ros_topic: /mir/errors_json
+            ros_type: std_msgs/msg/String
+            payload_format: json
+            list_path: errors
+          - source: ros_topic
+            ros_topic: /mir/state
+            ros_type: std_msgs/msg/String
+            payload_format: json
+            list_path: errors
+        item_mapping:
+          errorType:
+            candidate_paths: [type, module, code]
+            fallback_pattern: ERR_{index}
+          errorReferences:
+            field_path: references
+            empty_value: []
+          errorDescription:
+            candidate_paths: [description, message, error]
+            fallback: Unknown error
+          errorLevel:
+            candidate_paths: [level, severity]
+            allowed: [WARNING, URGENT, CRITICAL, FATAL]
+            fallback: CRITICAL
+        empty_value: []

@@ -1,0 +1,122 @@
+messages:
+  factsheet:
+    direction: outbound
+    source_owner: comm_manager.backend_publisher
+    meta:
+      topic_suffix: factsheet
+      qos: 1
+      retain: false
+    payload:
+      nodes: []
+      recipes: []
+      actions: []
+      mapInfo:
+        mapId: null
+        mapVerNo: null
+        mapData: []
+    fields:
+      nodes:
+        type: array
+        source: ros_topic
+        ros_topic: /mir/waypoints_json
+        ros_type: std_msgs/msg/String
+        payload_format: json
+        list_path: waypoints
+        max_items_config: outbound.backend_publisher.max_factsheet_nodes
+        item_mapping:
+          nodeId:
+            candidate_paths: [name, guid]
+            fallback_pattern: NODE_{index}
+            transform: topic_safe_id
+          nodeDescription:
+            candidate_paths: [name, guid]
+            fallback: ''
+          nodePosition:
+            x:
+              candidate_paths: [pos_x, x, position_x, position.x, pose.x, pos.x, map_position.x]
+              transform: round_3
+            y:
+              candidate_paths: [pos_y, y, position_y, position.y, pose.y, pos.y, map_position.y]
+              transform: round_3
+            theta:
+              candidate_paths: [yaw, theta, orientation, orientation_deg, raw.orientation, pos_orientation, position.orientation, pose.orientation, pos.theta, map_position.theta]
+              transform: angle_to_radians_round_3
+              default: 0.0
+        required_item_fields: [nodePosition.x, nodePosition.y]
+        empty_value: []
+      recipes:
+        type: array
+        source: ros_service
+        service: /recipe/query_list
+        srv_type: lges_recipe_interfaces/srv/QueryRecipeList
+        request:
+          include_details: true
+        response_json_field: recipes_json
+        response_list_path: recipes
+        refresh_sec_config: outbound.backend_publisher.recipe_list_refresh_sec
+        item_mapping:
+          recipeId:
+            candidate_paths: [recipe_id, recipeId, id, name]
+            fallback_pattern: RCP_{index}
+            transform: topic_safe_id
+          recipeSteps:
+            type: array
+            list_path: steps
+            item_mapping:
+              id:
+                field_path: id
+                fallback_pattern: STEP_{index}
+              seq:
+                field_path: seq
+              type:
+                field_path: type
+                empty_value: null
+              action:
+                field_path: action
+                empty_value: null
+              timeout_sec:
+                field_path: timeout_sec
+                transform: number_or_null
+              params:
+                field_path: params
+                empty_value: {}
+            empty_value: []
+        empty_value: []
+      actions:
+        type: array
+        source: not_available
+        reason: Supported factsheet action catalog is not confirmed yet.
+        empty_value: []
+      mapInfo:
+        type: object
+        source: mixed
+        object_fields:
+          mapId:
+            source_priority:
+              - source: ros_topic
+                ros_topic: /mir/state
+                ros_type: std_msgs/msg/String
+                payload_format: json
+                field_path: map_id
+              - source: ros_topic
+                ros_topic: /mir/waypoints_json
+                ros_type: std_msgs/msg/String
+                payload_format: json
+                field_path: map_id
+            empty_value: null
+          mapVerNo:
+            source: config
+            config_path: outbound.backend_publisher.map_ver_no
+            only_when: mapId is available
+            empty_value: null
+          mapData:
+            source: ros_service_dynamic
+            service: /mir/query/json
+            srv_type: mir_api_interfaces/srv/QueryJson
+            request:
+              query: map
+              id_from_context: mapId
+            response_json_field: raw_json
+            output_path: 'map'
+            publish_on_response: true
+            empty_value: []

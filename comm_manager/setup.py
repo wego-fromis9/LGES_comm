@@ -4,6 +4,18 @@ from glob import glob
 
 package_name = 'comm_manager'
 
+def collect_config_files():
+    data_files = []
+    for root, _dirs, files in os.walk('config'):
+        yaml_files = [
+            os.path.join(root, name)
+            for name in files
+            if name.endswith(('.yaml', '.yml'))
+        ]
+        if yaml_files:
+            data_files.append((os.path.join('share', package_name, root), yaml_files))
+    return data_files
+
 setup(
     name=package_name,
     version='1.0.0',
@@ -13,10 +25,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         # JSON 템플릿 등록
         (os.path.join('share', package_name, 'json_templates'), glob('comm_manager/json_templates/*.json')),
-        # ⭐️ 추가: config 폴더 등록!
-        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
-    ],
+    ] + collect_config_files(),
     install_requires=['setuptools', 'paho-mqtt'],
     zip_safe=True,
     maintainer='Robot Engineer',

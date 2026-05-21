@@ -1,0 +1,19 @@
+messages:
+  connection:
+    direction: outbound
+    source_owner: comm_manager.mqtt_core
+    meta:
+      topic_suffix: connection
+      qos: 1
+      retain: true
+    payload:
+      connectionState: CONNECTED
+    fields:
+      connectionState:
+        type: string
+        source: runtime_arg
+        runtime_key: connectionState
+        ros_topic: /connection_state
+        ros_type: comm_interfaces/msg/ConnectionState
+        field_path: state
+        description: CONNECTED or DISCONNECTED

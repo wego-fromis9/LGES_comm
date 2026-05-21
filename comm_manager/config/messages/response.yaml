@@ -1,0 +1,47 @@
+messages:
+  response:
+    direction: outbound_response
+    source_owner: comm_manager.inbound_handler
+    meta:
+      topic_suffix: response
+      qos: 1
+      retain: false
+    payload:
+      orderId: null
+      instantActionFlag: false
+      responseType: ACCEPTED
+      actions: []
+      reason: ''
+    fields:
+      orderId:
+        type: string
+        source: inbound_payload
+        source_field: orderId
+      instantActionFlag:
+        type: bool
+        source: inbound_message_type
+        false_when: order
+        true_when: instantActions
+      responseType:
+        type: enum
+        source: validation_or_service_result
+        allowed: [ACCEPTED, REJECTED, ERROR]
+        mappings_config: inbound.response.response_types
+      actions:
+        type: array
+        source: inbound_payload
+        source_fields: [actions, instantActions]
+        item_mapping:
+          actionId:
+            field_path: actionId
+          actionSeqNo:
+            field_path: actionSeqNo
+          actionDescriptor:
+            candidate_paths_config: inbound.response.actions.descriptor_source_fields
+            fallback_config: inbound.response.actions.descriptor_default
+          actionType:
+            field_path: actionType
+      reason:
+        type: string
+        source: validation_or_service_result_message
+        success_value: ''

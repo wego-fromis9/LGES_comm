@@ -49,12 +49,18 @@ def select_timestamp_value(payload, config):
     selected_ids.extend(_as_list(config.get("selected_ids")))
     id_fields = _as_list(config.get("id_field") or "id")
     timestamp_field = config.get("timestamp_field") or "timestamp"
+    payload_mode = _safe_text(config.get("payload_mode")).lower()
 
     direct_path = config.get("selected_timestamp_field") or config.get("timestamp_path")
     if direct_path:
         value = get_nested_value(payload, direct_path)
         if value not in (None, ""):
             return value, {"mode": "direct_path", "path": direct_path}
+
+    if payload_mode in {"header", "header_timestamp", "plain", "plain_timestamp"}:
+        value = get_nested_value(payload, timestamp_field)
+        if value not in (None, ""):
+            return value, {"mode": payload_mode, "path": timestamp_field}
 
     list_paths = _as_list(config.get("list_path"))
     if not list_paths:

@@ -1,0 +1,44 @@
+outbound:
+  publisher_owner: backend
+  backend_publisher:
+    enabled: true
+    canonical_state_topic: /lges/state_json
+    recipe_query_service: /recipe/query_list
+    recipe_list_refresh_sec: 5
+    recipe_query_service_wait_sec: 0.2
+    require_recipe_list_before_factsheet: true
+    current_waypoint_max_age_sec: 3.5
+    derive_velocity_from_pose: false
+    publish_when_mqtt_disconnected: false
+    map_ver_no: 1
+    max_factsheet_nodes: 300
+    max_action_history: 50
+    max_node_history: 200
+    defaults:
+      control_state: MANUAL
+      operation_state: INIT
+      safety_state: NORMAL
+    topics:
+      mir_state: /mir/state
+      mir_errors: /mir/errors_json
+      mir_waypoints: /mir/waypoints_json
+      mir_current_waypoint: /mir/current_waypoint_json
+      mir_reached_waypoint: /mir/reached_waypoint_json
+      system_safety_state: /system/safety_state
+      recipe_state: /recipe/state
+
+  state:
+    enabled: true
+    period_sec: 1
+
+  factsheet:
+    enabled: true
+    publish_on_start: true
+    publish_on_request: true
+    initial_delay_sec: 3
+    check_period_sec: 5
+
+  visualization:
+    enabled: false
+    period_sec: 1
+    clear_retained_when_disabled: true

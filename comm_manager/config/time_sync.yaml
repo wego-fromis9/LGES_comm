@@ -1,0 +1,40 @@
+time_sync:
+  source: broker_topic
+  ros_state_topic: /comm/time_sync_state
+  ros_state_publish_period_sec: 1.0
+  apply:
+    mqtt_payload_timestamp: true
+    system_clock: true
+  broker_topic:
+    enabled: true
+    # Broker sends sync.json after the robot publishes connection.
+    # Expected topic by suffix: uagv/v2/<manufacturer>/<serialNumber>/sync
+    # If the control side defines a full MQTT topic, set topic instead of topic_suffix.
+    # Example: topic: uagv/v2/WEGO/AMR-001/sync
+    topic: ''
+    topic_suffix: sync
+    payload_mode: header_timestamp
+    list_path: ''
+    id_field: id
+    selected_id: ''
+    direct_object_field: ''
+    timestamp_field: timestamp
+    qos: 1
+    accept_retained: false
+    wait_for_initial_sync_on_connect: false
+    require_before_outbound_publish: true
+    initial_sync_timeout_sec: 2.0
+    max_offset_sec: 86400
+    # 0 means keep the last broker offset until the next MQTT reconnect/update.
+    # If the broker sends this topic periodically, set a positive stale timeout.
+    stale_after_sec: 0
+    log_every_update: false
+  system_clock:
+    enabled: true
+    command: sudo -n /usr/local/sbin/lges-set-time '{timestamp}'
+    min_offset_sec: 1.0
+    max_offset_sec: 86400
+    cooldown_sec: 0
+    apply_once: false
+    timeout_sec: 5
+    dry_run: false

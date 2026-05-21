@@ -1,0 +1,29 @@
+messages:
+  visualization:
+    direction: outbound_optional
+    source_owner: comm_manager.backend_publisher
+    meta:
+      topic_suffix: visualization
+      qos: 0
+      retain: true
+    payload:
+      referenceStateHeaderId: null
+      robotPosition: null
+      velocity: null
+    fields:
+      referenceStateHeaderId:
+        type: integer
+        source: internal
+        internal_field: last_state_header_id
+        description: Header id of the most recently published state payload.
+        empty_value: null
+      robotPosition:
+        type: object
+        source: same_as
+        message: state
+        field: robotPosition
+      velocity:
+        type: object
+        source: same_as
+        message: state
+        field: velocity

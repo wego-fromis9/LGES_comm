@@ -26,6 +26,7 @@ from .wifi_core import WifiCore
 from .mqtt_core import MqttCore
 from .payload_validator import InboundPayloadValidator
 from .backend_publisher import BackendMqttPublisher
+from .config_loader import load_config_file
 
 from ament_index_python.packages import get_package_share_directory
 
@@ -63,8 +64,7 @@ def load_preinit_config():
     """Load config before rclpy.init for the single-instance lock."""
     try:
         path = resolve_config_path()
-        with open(path, 'r') as f:
-            return yaml.safe_load(f) or {}
+        return load_config_file(path)
     except Exception:
         return {}
 
@@ -164,6 +164,7 @@ class CommNode(Node):
         self.order_enabled = bool(self.order_config.get('enabled', True))
         self.order_service_name = str(self.order_config.get('service', '/recipe/run'))
         self.order_timeout_sec = float(self.order_config.get('timeout_sec', 0.0))
+        self.order_request_mapping = self.order_config.get('request_mapping') or {}
         self.order_sequence_config = self.order_config.get('sequence', {}) or {}
         self.order_require_monotonic_update_id = bool(
             self.order_sequence_config.get('require_monotonic_update_id', True)
@@ -184,6 +185,7 @@ class CommNode(Node):
         self.instant_action_action_id_source = str(
             self.instant_action_config.get('action_id_source', 'route') or 'route'
         ).strip().lower()
+        self.instant_action_request_mapping = self.instant_action_config.get('request_mapping') or {}
         configured_routes = self.instant_action_config.get('routes') or {}
         self.instant_action_routes = self.normalize_instant_action_routes(configured_routes)
         self.instant_action_fail_fast = bool(self.instant_action_config.get('fail_fast', True))
@@ -215,9 +217,12 @@ class CommNode(Node):
         try:
             path = resolve_config_path()
             self.config_path = path
-            with open(path, 'r') as f:
-                self.get_logger().info(f"Config 로드: {path}")
-                return yaml.safe_load(f)
+            config = load_config_file(path)
+            self.get_logger().info(f"Config 로드: {path}")
+            includes = config.get("_loaded_includes")
+            if includes:
+                self.get_logger().info(f"Config include 로드: {includes}")
+            return config
         except Exception as e:
             self.get_logger().error(f"Config 로드 실패, 기본값 사용: {e}")
             return {
@@ -444,6 +449,67 @@ class CommNode(Node):
             return self.call_instant_actions_service(payload)
         return self.call_inbound_trigger(message_type)
 
+    def record_backend_event(self, event):
+        publisher = getattr(self, "backend_publisher", None)
+        if publisher is None or not hasattr(publisher, "record_inbound_event"):
+            return
+        try:
+            publisher.record_inbound_event(event)
+        except Exception as exc:
+            self.get_logger().warn(f"Inbound history record failed: {exc}")
+
+    def record_order_history_event(self, payload, success, message, reason, request=None):
+        payload = payload if isinstance(payload, dict) else {}
+        order_id = (
+            getattr(request, "order_id", None)
+            if request is not None
+            else payload.get("orderId")
+        )
+        order_type = (
+            getattr(request, "order_type", None)
+            if request is not None
+            else payload.get("orderType")
+        )
+        recipe_id = (
+            getattr(request, "recipe_id", None)
+            if request is not None
+            else payload.get("recipeId")
+        )
+        update_id = (
+            getattr(request, "order_update_id", None)
+            if request is not None
+            else payload.get("orderUpdateId")
+        )
+        reason_text = str(reason or "")
+        error_reasons = {"validation_error", "service_error", "service_timeout", "service_exception"}
+        status = "ACCEPTED" if success else ("ERROR" if reason_text in error_reasons else "REJECTED")
+        description_parts = [
+            _part for _part in (str(order_type or "").upper(), str(recipe_id or "")) if _part
+        ]
+        self.record_backend_event({
+            "kind": "order",
+            "actionId": order_id,
+            "actionSeqNo": update_id,
+            "actionType": f"ORDER_{str(order_type or 'UNKNOWN').upper()}",
+            "actionDescription": " ".join(description_parts),
+            "actionStatus": status,
+            "actionResult": str(message or ""),
+        })
+
+    def record_instant_action_history_event(self, action, action_id, action_type, success, message, reason):
+        reason_text = str(reason or "")
+        error_reasons = {"validation_error", "service_error", "service_timeout", "service_exception"}
+        status = "ACCEPTED" if success else ("ERROR" if reason_text in error_reasons else "REJECTED")
+        self.record_backend_event({
+            "kind": "instantAction",
+            "actionId": action_id or (action or {}).get("actionId"),
+            "actionSeqNo": (action or {}).get("actionSeqNo"),
+            "actionType": action_type or (action or {}).get("actionType"),
+            "actionDescription": str((action or {}).get("actionDescription") or ""),
+            "actionStatus": status,
+            "actionResult": str(message or ""),
+        })
+
     def run_recipe_result_reason(self, result, message):
         response_type = str(getattr(result, 'response_type', '') or '').lower()
         result_code = str(getattr(result, 'result_code', '') or '').lower()
@@ -453,26 +519,139 @@ class CommNode(Node):
             return "service_error"
         return "service_rejected"
 
+    def first_payload_value(self, payload, fields, default=None):
+        for field in fields or []:
+            current = payload
+            for part in str(field).split("."):
+                if isinstance(current, dict):
+                    current = current.get(part)
+                else:
+                    current = None
+                if current is None:
+                    break
+            if current not in (None, ""):
+                return current
+        return default
+
+    def config_path_value(self, path, default=None):
+        current = self.config
+        for part in str(path or "").split("."):
+            if not part:
+                continue
+            if not isinstance(current, dict):
+                return default
+            current = current.get(part)
+            if current is None:
+                return default
+        return current
+
+    def transform_mapped_value(self, value, transform):
+        transform = str(transform or "").strip().lower()
+        if not transform:
+            return value
+        if transform == "int":
+            return int(value or 0)
+        if transform == "float":
+            return float(value or 0.0)
+        if transform == "upper":
+            return str(value or "").upper()
+        if transform == "lower":
+            return str(value or "").lower()
+        if transform == "string":
+            return str(value if value is not None else "")
+        if transform == "json_dumps":
+            return json.dumps(value, ensure_ascii=False)
+        return value
+
+    def normalize_instant_action_type(self, value):
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return ""
+        if raw in self.instant_action_routes:
+            return raw
+        compact = "".join(raw.split())
+        if compact in self.instant_action_routes:
+            return compact
+        for action_type in self.instant_action_routes:
+            compact_action_type = action_type.replace("_", "")
+            if compact == action_type + action_type:
+                return action_type
+            if compact == compact_action_type:
+                return action_type
+            if compact == compact_action_type + compact_action_type:
+                return action_type
+        return raw
+
+    def resolve_request_mapping_value(self, spec, payload, context=None):
+        context = context or {}
+        spec = spec if isinstance(spec, dict) else {"source": "literal", "value": spec}
+        source = str(spec.get("source", "payload") or "payload").strip()
+        default = spec.get("default")
+
+        if source == "payload":
+            value = self.first_payload_value(payload, spec.get("fields") or spec.get("payload_fields") or [], default)
+        elif source == "payload_json":
+            value = json.dumps(payload or {}, ensure_ascii=False)
+        elif source == "config":
+            value = self.config_path_value(spec.get("path"), default)
+        elif source == "route_or_payload":
+            route = context.get("route") if isinstance(context.get("route"), dict) else {}
+            if self.instant_action_action_id_source == "payload":
+                value = self.first_payload_value(payload, spec.get("payload_fields") or [], None)
+                if value in (None, ""):
+                    value = route.get(spec.get("route_field", "action_id"))
+            else:
+                value = route.get(spec.get("route_field", "action_id"))
+                if value in (None, ""):
+                    value = self.first_payload_value(payload, spec.get("payload_fields") or [], None)
+            if value in (None, ""):
+                value = default
+        elif source == "instant_action_input_json":
+            value = self.build_instant_action_input_json(payload)
+        elif source == "literal":
+            value = spec.get("value", default)
+        else:
+            value = default
+
+        return self.transform_mapped_value(value, spec.get("transform"))
+
+    def apply_service_request_mapping(self, request, mapping, payload, context=None):
+        for request_field, spec in (mapping or {}).items():
+            if not hasattr(request, request_field):
+                self.get_logger().warn(f"Service request field not found, skipped: {request_field}")
+                continue
+            try:
+                setattr(request, request_field, self.resolve_request_mapping_value(spec, payload, context))
+            except Exception as exc:
+                raise ValueError(f"failed to map service request field '{request_field}': {exc}") from exc
+
     def call_order_service(self, payload):
         sequence_ok, sequence_message, duplicate = self.validate_order_sequence(payload)
         if not sequence_ok:
+            self.record_order_history_event(payload, False, sequence_message, "service_rejected")
             return False, sequence_message, "service_rejected"
         if duplicate:
             return True, sequence_message, "service_accepted"
 
         if self.order_client is None:
+            self.record_order_history_event(payload, False, "order service is not configured", "service_not_configured")
             return False, "order service is not configured", "service_not_configured"
         if not self.order_client.wait_for_service(timeout_sec=self.inbound_service_wait_timeout_sec):
-            return False, f"service unavailable: {self.order_service_name}", "service_unavailable"
+            message = f"service unavailable: {self.order_service_name}"
+            self.record_order_history_event(payload, False, message, "service_unavailable")
+            return False, message, "service_unavailable"
 
         request = RunRecipe.Request()
-        request.execution_id = str(payload.get("executionId") or payload.get("execution_id") or "")
-        request.order_id = str(payload.get("orderId") or "")
-        request.order_update_id = int(payload.get("orderUpdateId") or 0)
-        request.order_type = str(payload.get("orderType") or "AUTO").upper()
-        request.recipe_id = str(payload.get("recipeId") or "")
-        request.input_json = json.dumps(payload, ensure_ascii=False)
-        request.timeout_sec = self.order_timeout_sec
+        mapping = self.order_request_mapping or {
+            "execution_id": {"source": "payload", "fields": ["executionId", "execution_id"], "default": ""},
+            "order_id": {"source": "payload", "fields": ["orderId"], "default": ""},
+            "order_update_id": {"source": "payload", "fields": ["orderUpdateId"], "transform": "int", "default": 0},
+            "order_type": {"source": "payload", "fields": ["orderType"], "transform": "upper", "default": "AUTO"},
+            "recipe_id": {"source": "payload", "fields": ["recipeId"], "default": ""},
+            "input_json": {"source": "payload_json"},
+            "timeout_sec": {"source": "literal", "value": self.order_timeout_sec},
+        }
+        self.apply_service_request_mapping(request, mapping, payload)
 
         self.get_logger().info(
             "Order service call -> "
@@ -487,13 +666,17 @@ class CommNode(Node):
 
         if not done.wait(timeout=self.inbound_service_timeout_sec):
             self.clear_order_inflight(payload)
-            return False, f"service timeout: {self.order_service_name}", "service_timeout"
+            message = f"service timeout: {self.order_service_name}"
+            self.record_order_history_event(payload, False, message, "service_timeout", request=request)
+            return False, message, "service_timeout"
 
         try:
             result = future.result()
         except Exception as e:
             self.clear_order_inflight(payload)
-            return False, f"service exception: {e}", "service_exception"
+            message = f"service exception: {e}"
+            self.record_order_history_event(payload, False, message, "service_exception", request=request)
+            return False, message, "service_exception"
 
         accepted = bool(getattr(result, 'accepted', False))
         response_type = str(getattr(result, 'response_type', '') or '')
@@ -508,6 +691,7 @@ class CommNode(Node):
         if accepted:
             self.remember_order(payload)
         self.clear_order_inflight(payload)
+        self.record_order_history_event(payload, accepted, summary, reason, request=request)
         return accepted, summary, reason
 
     def order_payload_hash(self, payload):
@@ -652,7 +836,11 @@ class CommNode(Node):
         return "service_rejected"
 
     def call_one_instant_action_service(self, action, index):
-        action_type = str(action.get("actionType") or action.get("action_type") or "").strip().lower()
+        raw_action_type = action.get("actionType") or action.get("action_type") or ""
+        action_type = self.normalize_instant_action_type(raw_action_type)
+        mapped_action = dict(action or {})
+        mapped_action["actionType"] = action_type
+        mapped_action["action_type"] = action_type
         route = self.instant_action_routes.get(action_type, {})
         source_action_id = str(
             action.get("actionId")
@@ -672,26 +860,57 @@ class CommNode(Node):
         service_name = str(route.get("service") or self.instant_action_service_name).strip()
 
         if not source_action_id:
-            return False, f"instantActions[{index}] missing actionId", "service_rejected"
+            message = f"instantActions[{index}] missing actionId"
+            self.record_instant_action_history_event(action, source_action_id, action_type, False, message, "service_rejected")
+            return False, message, "service_rejected"
         if not action_type:
-            return False, f"instantActions[{index}] missing actionType", "service_rejected"
+            message = f"instantActions[{index}] missing actionType"
+            self.record_instant_action_history_event(action, source_action_id, action_type, False, message, "service_rejected")
+            return False, message, "service_rejected"
         if action_type not in self.instant_action_routes:
-            return False, f"unsupported instant action type: {action_type}", "service_rejected"
+            message = f"unsupported instant action type: {action_type}"
+            self.record_instant_action_history_event(action, source_action_id, action_type, False, message, "service_rejected")
+            return False, message, "service_rejected"
         route_mode = str(route.get("mode") or "").strip().lower()
         if action_type == "request_factsheet" or route_mode in ("publish_backend", "publish_factsheet"):
-            return self.handle_request_factsheet(action, source_action_id, action_id, action_type)
+            success, message, reason = self.handle_request_factsheet(mapped_action, source_action_id, action_id, action_type)
+            self.record_instant_action_history_event(mapped_action, action_id, action_type, success, message, reason)
+            return success, message, reason
 
         client = self.get_instant_action_client(service_name)
         if client is None:
-            return False, "instant action service is not configured", "service_not_configured"
+            message = "instant action service is not configured"
+            self.record_instant_action_history_event(mapped_action, action_id, action_type, False, message, "service_not_configured")
+            return False, message, "service_not_configured"
         if not client.wait_for_service(timeout_sec=self.inbound_service_wait_timeout_sec):
-            return False, f"service unavailable: {service_name}", "service_unavailable"
+            message = f"service unavailable: {service_name}"
+            self.record_instant_action_history_event(mapped_action, action_id, action_type, False, message, "service_unavailable")
+            return False, message, "service_unavailable"
 
         request = SendInstantAction.Request()
-        request.action_id = action_id
-        request.action_type = action_type
-        request.blocking_type = blocking_type
-        request.input_json = self.build_instant_action_input_json(action)
+        mapping = self.instant_action_request_mapping or {
+            "action_id": {
+                "source": "literal",
+                "value": action_id,
+            },
+            "action_type": {
+                "source": "payload",
+                "fields": ["actionType", "action_type"],
+                "transform": "lower",
+                "default": action_type,
+            },
+            "blocking_type": {
+                "source": "payload",
+                "fields": ["blockingType", "blocking_type"],
+                "default": blocking_type,
+            },
+            "input_json": {
+                "source": "instant_action_input_json",
+            },
+        }
+        self.apply_service_request_mapping(request, mapping, mapped_action, context={"route": route})
+        action_id = request.action_id
+        action_type = request.action_type
 
         self.get_logger().info(
             "InstantAction service call -> "
@@ -705,12 +924,16 @@ class CommNode(Node):
         future.add_done_callback(lambda _future: done.set())
 
         if not done.wait(timeout=self.inbound_service_timeout_sec):
-            return False, f"service timeout: {service_name}", "service_timeout"
+            message = f"service timeout: {service_name}"
+            self.record_instant_action_history_event(mapped_action, action_id, action_type, False, message, "service_timeout")
+            return False, message, "service_timeout"
 
         try:
             result = future.result()
         except Exception as e:
-            return False, f"service exception: {e}", "service_exception"
+            message = f"service exception: {e}"
+            self.record_instant_action_history_event(mapped_action, action_id, action_type, False, message, "service_exception")
+            return False, message, "service_exception"
 
         accepted = bool(getattr(result, 'accepted', False))
         response_type = str(getattr(result, 'response_type', '') or '')
@@ -725,7 +948,9 @@ class CommNode(Node):
         if message:
             summary += f" - {message}"
 
-        return accepted, summary, self.instant_action_result_reason(result, message)
+        reason = self.instant_action_result_reason(result, message)
+        self.record_instant_action_history_event(mapped_action, action_id, action_type, accepted, summary, reason)
+        return accepted, summary, reason
 
     def handle_request_factsheet(self, action, source_action_id, mapped_action_id, action_type):
         if not self.backend_publisher or not self.backend_publisher.can_publish_factsheet():
@@ -805,6 +1030,7 @@ class CommNode(Node):
         if not isinstance(payload, dict):
             return []
 
+        is_instant_payload = "instantActions" in payload
         source_actions = payload.get("actions") or payload.get("instantActions") or []
         if not isinstance(source_actions, list):
             return []
@@ -819,7 +1045,9 @@ class CommNode(Node):
             if not isinstance(action, dict):
                 continue
             action_type = action.get("actionType") or action.get("action_type") or "UNKNOWN"
-            route = self.instant_action_routes.get(str(action_type).strip().lower(), {})
+            if is_instant_payload:
+                action_type = self.normalize_instant_action_type(action_type)
+            route = self.instant_action_routes.get(str(action_type).strip().lower(), {}) if is_instant_payload else {}
             action_id = action.get("actionId") or action.get("action_id") or route.get("action_id") or f"ACT_{index:03d}"
             action_descriptor = self.resolve_action_descriptor(
                 action,
@@ -883,8 +1111,10 @@ class CommNode(Node):
         response_type = str(response_type).upper()
         if response_type not in RESPONSE_TYPES:
             response_type = "ERROR"
+        is_instant_action_response = str(message_type or "").strip() == "instantActions"
         response_payload = {
-            "responseOrderHeaderId": payload.get("headerId") if isinstance(payload, dict) else None,
+            "orderId": payload.get("orderId") if isinstance(payload, dict) else None,
+            "instantActionFlag": is_instant_action_response,
             "responseType": response_type,
             "actions": self.normalize_response_actions(payload),
             "reason": "" if success else str(message or "request rejected")

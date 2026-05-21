@@ -1,0 +1,38 @@
+messages:
+  order:
+    direction: inbound
+    source_owner: broker_or_host
+    routing:
+      handler: comm_manager.inbound_handler.call_order_service
+      service: /recipe/run
+      srv_type: lges_recipe_interfaces/srv/RunRecipe
+      config_path: inbound.order
+      notes:
+        - This MQTT payload is received from the broker/host.
+        - It is not populated from ROS topics.
+        - AUTO uses recipeId.
+        - SEMI_AUTO forwards the standard Order JSON/actions array through input_json.
+    meta:
+      topic_suffix: order
+      qos: 1
+      retain: false
+    payload:
+      orderId: ''
+      orderUpdateId: 1
+      orderType: AUTO
+      recipeId: ''
+      actions: []
+    fields:
+      orderId:
+        type: string
+      orderUpdateId:
+        type: integer
+      orderType:
+        type: enum
+        allowed: [AUTO, SEMI_AUTO]
+      recipeId:
+        type: string
+        required_when: orderType == AUTO
+      actions:
+        type: array
+        required_when: orderType == SEMI_AUTO

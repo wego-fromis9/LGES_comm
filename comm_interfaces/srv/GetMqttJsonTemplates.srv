@@ -11,10 +11,15 @@ string message
 #   "templates": [
 #     {
 #       "messageType": "state",
+#       "direction": "outbound",
+#       "sourceOwner": "comm_manager.backend_publisher",
 #       "topicSuffix": "state",
 #       "qos": 0,
 #       "retain": true,
-#       "payloadTemplate": {}
+#       "payloadTemplate": {},
+#       "headerFields": ["headerId", "timestamp", "version", "manufacturer", "serialNumber"],
+#       "fields": {},
+#       "routing": {}
 #     }
 #   ]
 # }

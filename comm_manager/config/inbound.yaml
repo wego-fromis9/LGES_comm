@@ -1,0 +1,117 @@
+inbound:
+  auto_response: true
+  service_wait_timeout_sec: 0.5
+  service_timeout_sec: 3
+
+  response:
+    response_types:
+      validation_error: ERROR
+      service_not_configured: REJECTED
+      service_unavailable: REJECTED
+      service_timeout: ERROR
+      service_exception: ERROR
+      service_rejected: REJECTED
+      service_error: ERROR
+      service_accepted: ACCEPTED
+    service_error_message_patterns:
+      - error
+      - exception
+      - fault
+      - failed
+      - timeout
+    actions:
+      descriptor_source_fields:
+        - actionDescriptor
+        - actionDescription
+      descriptor_fallback_field: ''
+      descriptor_default: ''
+
+  order:
+    enabled: true
+    service: /recipe/run
+    timeout_sec: 0
+    srv_type: lges_recipe_interfaces/srv/RunRecipe
+    request_mapping:
+      execution_id:
+        source: payload
+        fields: [executionId, execution_id]
+        default: ''
+      order_id:
+        source: payload
+        fields: [orderId]
+        default: ''
+      order_update_id:
+        source: payload
+        fields: [orderUpdateId]
+        transform: int
+        default: 0
+      order_type:
+        source: payload
+        fields: [orderType]
+        transform: upper
+        default: AUTO
+      recipe_id:
+        source: payload
+        fields: [recipeId]
+        default: ''
+      input_json:
+        source: payload_json
+      timeout_sec:
+        source: config
+        path: inbound.order.timeout_sec
+        transform: float
+        default: 0
+    sequence:
+      deduplicate: true
+      require_monotonic_update_id: true
+
+  instant_actions:
+    enabled: true
+    service: /recipe/instant_action
+    srv_type: lges_recipe_interfaces/srv/SendInstantAction
+    default_input_json: '{}'
+    action_id_source: route
+    fail_fast: true
+    request_mapping:
+      action_id:
+        source: route_or_payload
+        route_field: action_id
+        payload_fields: [actionId, action_id]
+        default: ''
+      action_type:
+        source: payload
+        fields: [actionType, action_type]
+        transform: lower
+        default: ''
+      blocking_type:
+        source: payload
+        fields: [blockingType, blocking_type]
+        default: ''
+      input_json:
+        source: instant_action_input_json
+    routes:
+      start_pause:
+        action_id: IA_START_PAUSE_001
+        service: /recipe/instant_action
+      stop_pause:
+        action_id: IA_STOP_PAUSE_001
+        service: /recipe/instant_action
+      start_charge:
+        action_id: IA_START_CHARGE_001
+        service: /recipe/instant_action
+      stop_charge:
+        action_id: IA_STOP_CHARGE_001
+        service: /recipe/instant_action
+      cancel_order:
+        action_id: IA_CANCEL_ORDER_001
+        service: /recipe/instant_action
+      clear_instant_actions:
+        action_id: IA_CLEAR_INSTANT_ACTIONS_001
+        service: /recipe/instant_action
+      request_factsheet:
+        action_id: IA_REQUEST_FACTSHEET_001
+        mode: publish_backend
+
+  triggers:
+    order: /comm/order_received
+    instantActions: /comm/instant_actions_received

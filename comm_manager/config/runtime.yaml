@@ -1,0 +1,7 @@
+robot:
+  manufacturer: WEGO
+  serial_number: AMR-001
+  version: 2.0.0
+
+runtime:
+  lock_file: /tmp/lges_comm_node_AMR-001.lock

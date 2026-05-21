@@ -1,0 +1,5 @@
+network:
+  manage_wifi: false
+  ssid: B-504
+  password: welcome!2005
+  min_signal_threshold: 140

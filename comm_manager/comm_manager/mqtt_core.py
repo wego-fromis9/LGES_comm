@@ -13,27 +13,68 @@ from paho.mqtt.properties import Properties
 
 from ament_index_python.packages import get_package_share_directory
 from .broker_time_sync import parse_timestamp_value, select_timestamp_value
+from .config_loader import deep_merge
 
 class MqttCore:
     def __init__(self, config, logger):
         self.logger = logger
         self.mqtt_config = config.get('mqtt', {})
         self.robot_config = config.get('robot', {})
+        self.message_templates_config = config.get('messages', {}) or {}
         
-        self.manufacturer = self.robot_config.get('manufacturer', 'MANU')
-        self.serial_number = self.robot_config.get('serial_number', 'AMR-001')
-        self.base_topic = f"uagv/v2/{self.manufacturer}/{self.serial_number}"
+        self.header_config = self.mqtt_config.get('header', {}) or {}
+        self.header_fields_config = self.header_config.get('fields', {}) or {}
+        self.manufacturer = (
+            self.header_config.get('manufacturer')
+            or self.header_config.get('manufacturerName')
+            or self.robot_config.get('manufacturer')
+            or 'MANU'
+        )
+        self.serial_number = (
+            self.header_config.get('serialNumber')
+            or self.header_config.get('serial_number')
+            or self.robot_config.get('serial_number')
+            or self.robot_config.get('serialNumber')
+            or 'AMR-001'
+        )
+        self.version = (
+            self.header_config.get('version')
+            or self.robot_config.get('version')
+            or '2.0.0'
+        )
+        self.base_topic = self._resolve_base_topic()
         
         self.broker_ip = self.mqtt_config.get('broker_ip', '127.0.0.1')
-        self.port = self.mqtt_config.get('port', 1883)
-        self.keep_alive = self.mqtt_config.get('keep_alive', 20)
+        self.port = int(self.mqtt_config.get('port', 1883) or 1883)
+        self.keep_alive = int(self.mqtt_config.get('keep_alive', 20) or 20)
+        self.keep_alive_policy_config = self.mqtt_config.get('keep_alive_policy', {}) or {}
+        self.keep_alive_detection_multiplier = float(
+            self.keep_alive_policy_config.get('detection_threshold_multiplier', 1.5)
+        )
+        self.keep_alive_detection_threshold_sec = (
+            self.keep_alive * self.keep_alive_detection_multiplier
+        )
+        self.lwt_config = self.mqtt_config.get('lwt', {}) or {}
+        self.lwt_delay_interval_sec = int(
+            self.lwt_config.get(
+                'delay_interval_sec',
+                self.keep_alive_policy_config.get('lwt_grace_delay_sec', 0)
+            ) or 0
+        )
+        self.keep_alive_expected_lwt_sec = (
+            self.keep_alive_detection_threshold_sec + max(self.lwt_delay_interval_sec, 0)
+        )
         self.client_id = self.mqtt_config.get('client_id') or self.serial_number
         self.require_publish_ack = bool(self.mqtt_config.get('require_publish_ack', True))
         self.publish_ack_timeout_sec = float(self.mqtt_config.get('publish_ack_timeout_sec', 5.0))
+        self.payload_config = self.mqtt_config.get('payload', {}) or {}
+        self.prune_null_payload_fields = bool(self.payload_config.get('prune_nulls', False))
         self.inbound_qos = int(self.mqtt_config.get('inbound_qos', 1))
         self.session_expiry_interval_sec = int(self.mqtt_config.get('session_expiry_interval_sec', 0))
         self.clean_start = bool(self.mqtt_config.get('clean_start', True))
-        self.version = self.robot_config.get('version', '2.0.0')
+        self.protocol_name = str(self.mqtt_config.get('protocol', 'mqttv5') or 'mqttv5').strip().lower()
+        self.mqtt_protocol = self._resolve_mqtt_protocol()
+        self.using_mqtt_v5 = self.mqtt_protocol == mqtt.MQTTv5
         self.timestamp_config = self.mqtt_config.get('timestamp', {}) or {}
         if not isinstance(self.timestamp_config, dict):
             self.timestamp_config = {'timezone': self.timestamp_config}
@@ -105,7 +146,7 @@ class MqttCore:
             self.logger.error(f"템플릿 경로를 찾을 수 없습니다: {e}")
             self.template_dir = ""
         
-        self.client = mqtt.Client(client_id=self.client_id, protocol=mqtt.MQTTv5)
+        self.client = mqtt.Client(client_id=self.client_id, protocol=self.mqtt_protocol)
         self._setup_auth_tls()
         self._setup_reconnect_backoff()
         
@@ -120,6 +161,7 @@ class MqttCore:
         self.client.on_message = self._internal_on_message
 
         self._setup_lwt()
+        self._log_keep_alive_policy()
 
     def _setup_auth_tls(self):
         auth = self.mqtt_config.get('auth', {}) or {}
@@ -149,6 +191,26 @@ class MqttCore:
         if bool(tls.get('insecure', False)):
             self.client.tls_insecure_set(True)
 
+    def _resolve_base_topic(self):
+        topic_config = self.mqtt_config.get('topic', {}) or {}
+        template = (
+            self.mqtt_config.get('base_topic')
+            or topic_config.get('base')
+            or topic_config.get('base_topic')
+            or "uagv/v2/{manufacturer}/{serialNumber}"
+        )
+        context = {
+            "manufacturer": self.manufacturer,
+            "serialNumber": self.serial_number,
+            "serial_number": self.serial_number,
+            "version": self.version,
+        }
+        try:
+            return str(template).format(**context).strip().strip("/")
+        except Exception as exc:
+            self.logger.warn(f"MQTT base topic format 실패({template}): {exc}. 기본 topic을 사용합니다.")
+            return f"uagv/v2/{self.manufacturer}/{self.serial_number}"
+
     def _setup_reconnect_backoff(self):
         backoff = self.mqtt_config.get('reconnect_backoff', {}) or {}
         min_delay = float(backoff.get('min_delay_sec', 1.0))
@@ -158,14 +220,26 @@ class MqttCore:
         except Exception as e:
             self.logger.warn(f"MQTT reconnect delay 설정 실패: {e}")
 
+    def _resolve_mqtt_protocol(self):
+        if self.protocol_name in ("mqttv311", "mqtt311", "v311", "3.1.1", "311"):
+            return mqtt.MQTTv311
+        if self.protocol_name in ("mqttv31", "mqtt31", "v31", "3.1", "31"):
+            return mqtt.MQTTv31
+        if self.protocol_name not in ("mqttv5", "mqtt5", "v5", "5"):
+            self.logger.warn(f"알 수 없는 MQTT protocol '{self.protocol_name}', mqttv5를 사용합니다.")
+        return mqtt.MQTTv5
+
     def _connect_properties(self):
+        if not self.using_mqtt_v5:
+            return None
         props = Properties(PacketTypes.CONNECT)
         props.SessionExpiryInterval = self.session_expiry_interval_sec
         return props
 
     def _will_properties(self):
-        lwt_config = self.mqtt_config.get('lwt', {}) or {}
-        delay = int(lwt_config.get('delay_interval_sec', 0) or 0)
+        if not self.using_mqtt_v5:
+            return None
+        delay = self.lwt_delay_interval_sec
         if delay <= 0:
             return None
         props = Properties(PacketTypes.WILLMESSAGE)
@@ -174,19 +248,41 @@ class MqttCore:
 
     def _setup_lwt(self):
         """LWT(유언장)도 템플릿을 읽어서 동적으로 생성합니다."""
-        lwt_config = self.mqtt_config.get('lwt', {}) or {}
+        lwt_config = self.lwt_config
         if not bool(lwt_config.get('enabled', True)):
             return
         lwt_payload, meta = self._build_from_template('connection', connectionState="DISCONNECTED")
         if lwt_payload and meta:
             lwt_topic = f"{self.base_topic}/{meta['topic_suffix']}"
-            self.client.will_set(
-                topic=lwt_topic,
-                payload=json.dumps(lwt_payload),
-                qos=int(lwt_config.get('qos', meta['qos'])),
-                retain=bool(lwt_config.get('retain', meta['retain'])),
-                properties=self._will_properties()
-            )
+            kwargs = {
+                "topic": lwt_topic,
+                "payload": json.dumps(lwt_payload),
+                "qos": int(lwt_config.get('qos', meta['qos'])),
+                "retain": bool(lwt_config.get('retain', meta['retain'])),
+            }
+            will_props = self._will_properties()
+            if will_props is not None:
+                kwargs["properties"] = will_props
+            self.client.will_set(**kwargs)
+
+    def _log_keep_alive_policy(self):
+        lwt_enabled = bool(self.lwt_config.get('enabled', True))
+        lwt_delay_text = (
+            f"{self.lwt_delay_interval_sec}s" if lwt_enabled and self.lwt_delay_interval_sec > 0
+            else "disabled"
+        )
+        if lwt_enabled and self.lwt_delay_interval_sec > 0 and not self.using_mqtt_v5:
+            lwt_delay_text = "disabled (requires MQTT v5)"
+        self.logger.info(
+            "MQTT Keep Alive policy: "
+            f"protocol={self.protocol_name}, "
+            f"interval={self.keep_alive}s, "
+            f"broker_detection={self.keep_alive_detection_threshold_sec:.1f}s "
+            f"(keep_alive * {self.keep_alive_detection_multiplier:g}), "
+            f"lwt_delay={lwt_delay_text}, "
+            f"expected_abnormal_notice≈{self.keep_alive_expected_lwt_sec:.1f}s, "
+            "heartbeat=MQTT PINGREQ/PINGRESP"
+        )
 
     def _resolve_broker_time_topic(self):
         if not self.broker_time_sync_enabled:
@@ -200,7 +296,7 @@ class MqttCore:
         if explicit_topic:
             return explicit_topic
 
-        suffix = str(self.broker_time_config.get('topic_suffix', 'timeSync') or 'timeSync')
+        suffix = str(self.broker_time_config.get('topic_suffix', 'sync') or 'sync')
         suffix = suffix.strip().strip('/')
         if not suffix:
             return ""
@@ -253,7 +349,7 @@ class MqttCore:
                 if self.loop_started:
                     self.client.reconnect()
                 else:
-                    try:
+                    if self.using_mqtt_v5:
                         self.client.connect(
                             self.broker_ip,
                             self.port,
@@ -261,7 +357,7 @@ class MqttCore:
                             clean_start=self.clean_start,
                             properties=self._connect_properties()
                         )
-                    except TypeError:
+                    else:
                         self.client.connect(self.broker_ip, self.port, self.keep_alive)
                     self.client.loop_start()
                     self.loop_started = True
@@ -494,7 +590,8 @@ class MqttCore:
             )
             return False
 
-        timestamp = broker_time.astimezone(timezone.utc).replace(microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ')
+        target_time = datetime.now(timezone.utc) + timedelta(seconds=float(offset_sec))
+        timestamp = target_time.astimezone(timezone.utc).replace(microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ')
         command = self.system_clock_command.format(timestamp=timestamp)
         if self.system_clock_dry_run:
             self.system_clock_last_apply_at = now_monotonic
@@ -552,7 +649,7 @@ class MqttCore:
 
         self.report_broker_time_state(
             "SYSTEM_CLOCK_SYNCED",
-            f"system clock synced by broker timestamp: {timestamp}",
+            f"system clock synced by broker offset: {timestamp}",
             topic=topic,
             broker_timestamp=broker_time.isoformat(),
             offset_sec=0.0,
@@ -668,7 +765,35 @@ class MqttCore:
     def _load_template(self, template_name):
         filepath = self._template_path(template_name)
         with open(filepath, 'r') as f:
-            return json.load(f)
+            template = json.load(f)
+        return self._apply_template_config(template_name, template)
+
+    def _message_config_for(self, template_name):
+        if not isinstance(self.message_templates_config, dict):
+            return {}
+        candidates = [
+            str(template_name),
+            str(template_name).strip().lower(),
+        ]
+        for key in candidates:
+            value = self.message_templates_config.get(key)
+            if isinstance(value, dict):
+                return value
+        return {}
+
+    def _apply_template_config(self, template_name, template):
+        override = self._message_config_for(template_name)
+        if not override:
+            return template
+
+        configured = deepcopy(template)
+        meta_override = override.get("_meta") or override.get("meta") or {}
+        payload_override = override.get("payload") or {}
+        if isinstance(meta_override, dict):
+            configured["_meta"] = deep_merge(configured.get("_meta", {}), meta_override)
+        if isinstance(payload_override, dict):
+            configured["payload"] = deep_merge(configured.get("payload", {}), payload_override)
+        return configured
 
     def get_template_catalog(self, message_type=""):
         requested = str(message_type or "").strip().strip("/")
@@ -685,23 +810,23 @@ class MqttCore:
         for name in names:
             template = self._load_template(name)
             meta = template.get("_meta", {}) or {}
+            message_config = self._message_config_for(name)
             templates.append({
                 "messageType": name,
+                "direction": message_config.get("direction", "outbound"),
+                "sourceOwner": message_config.get("source_owner", ""),
                 "topicSuffix": meta.get("topic_suffix", name),
                 "qos": int(meta.get("qos", 0)),
                 "retain": bool(meta.get("retain", False)),
                 "payloadTemplate": deepcopy(template.get("payload", {})),
-                "headerFields": [
-                    "headerId",
-                    "timestamp",
-                    "version",
-                    "manufacturer",
-                    "serialNumber"
-                ]
+                "headerFields": list(self._default_header_values().keys()),
+                "fields": deepcopy(message_config.get("fields", {})),
+                "routing": deepcopy(message_config.get("routing", {})),
             })
 
         return {
             "baseTopic": self.base_topic,
+            "commonHeader": deepcopy(self.header_fields_config),
             "templates": templates
         }
 
@@ -716,13 +841,9 @@ class MqttCore:
         meta = template.get("_meta", {})
         payload = deepcopy(template.get("payload", {}))
 
-        # 1. 공통 필수 Header 자동 채우기
-        payload["headerId"] = kwargs.pop("headerId", self.header_id_counter)
-        self.header_id_counter += 1
-        payload["timestamp"] = kwargs.pop("timestamp", self.current_timestamp())
-        payload["version"] = kwargs.pop("version", self.version)
-        payload["manufacturer"] = kwargs.pop("manufacturer", self.manufacturer)
-        payload["serialNumber"] = kwargs.pop("serialNumber", self.serial_number)
+        # 1. 공통 Header 자동 채우기
+        for field_name, field_value in self._build_header_values(kwargs).items():
+            payload[field_name] = field_value
 
         # 2. 외부에서 주입된 데이터(kwargs)로 템플릿 덮어쓰기
         self._deep_merge(payload, kwargs)
@@ -737,6 +858,63 @@ class MqttCore:
             else:
                 base[key] = value
         return base
+
+    def _default_header_values(self):
+        return {
+            "headerId": None,
+            "timestamp": None,
+            "version": self.version,
+            "manufacturer": self.manufacturer,
+            "serialNumber": self.serial_number,
+        }
+
+    def _header_field_value(self, field_name, spec, kwargs):
+        if field_name in kwargs:
+            return kwargs.pop(field_name)
+
+        if not isinstance(spec, dict):
+            if spec is not None:
+                return spec
+            spec = {}
+
+        source = str(spec.get("source", "") or "").strip().lower()
+        if "value" in spec:
+            return spec.get("value")
+        if source == "counter" or field_name == "headerId":
+            value = self.header_id_counter
+            self.header_id_counter += 1
+            return value
+        if source == "timestamp" or field_name == "timestamp":
+            return self.current_timestamp()
+        if field_name == "version":
+            return self.version
+        if field_name == "manufacturer":
+            return self.manufacturer
+        if field_name == "serialNumber":
+            return self.serial_number
+        return spec.get("default")
+
+    def _build_header_values(self, kwargs):
+        default_values = self._default_header_values()
+        configured_fields = self.header_fields_config if isinstance(self.header_fields_config, dict) else {}
+        if configured_fields:
+            fields = configured_fields
+        else:
+            fields = {
+                "headerId": {"source": "counter"},
+                "timestamp": {"source": "timestamp"},
+                "version": {"value": self.version},
+                "manufacturer": {"value": self.manufacturer},
+                "serialNumber": {"value": self.serial_number},
+            }
+
+        values = {}
+        for field_name, spec in fields.items():
+            value = self._header_field_value(str(field_name), spec, kwargs)
+            if value is None and field_name in default_values:
+                value = default_values[field_name]
+            values[str(field_name)] = value
+        return values
 
     def _prune_nulls(self, value):
         """사양서 optional 필드는 값이 없을 때 전송하지 않도록 None을 제거한다."""
@@ -802,7 +980,8 @@ class MqttCore:
             retain_value = False if retain is None else retain
 
         topic = f"{self.base_topic}/{topic_suffix}"
-        built_payload = self._prune_nulls(built_payload)
+        if self.prune_null_payload_fields:
+            built_payload = self._prune_nulls(built_payload)
         info = self.client.publish(
             topic,
             json.dumps(built_payload, ensure_ascii=False),
