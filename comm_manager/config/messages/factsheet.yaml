@@ -17,12 +17,22 @@ messages:
     fields:
       nodes:
         type: array
-        source: ros_topic
-        ros_topic: /mir/waypoints_json
-        ros_type: std_msgs/msg/String
-        payload_format: json
-        list_path: waypoints
+        source: mir_rest_api
+        request:
+          path_template: /maps/{id}/positions
+          id_from_topic:
+            ros_topic: /mir/state
+            ros_type: std_msgs/msg/String
+            payload_format: json
+            field_path: map_id
+        enrich_items:
+          path_template: /positions/{id}
+          id_paths: [guid, id]
+          required_paths: [pos_x, x]
+          merge: true
         max_items_config: outbound.backend_publisher.max_factsheet_nodes
+        exclude_item_names_config: outbound.backend_publisher.position_exclude_names
+        exclude_item_rules_config: outbound.backend_publisher.position_exclude_rules
         item_mapping:
           nodeId:
             candidate_paths: [name, guid]
@@ -95,11 +105,6 @@ messages:
             source_priority:
               - source: ros_topic
                 ros_topic: /mir/state
-                ros_type: std_msgs/msg/String
-                payload_format: json
-                field_path: map_id
-              - source: ros_topic
-                ros_topic: /mir/waypoints_json
                 ros_type: std_msgs/msg/String
                 payload_format: json
                 field_path: map_id

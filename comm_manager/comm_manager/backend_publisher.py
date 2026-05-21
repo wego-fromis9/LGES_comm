@@ -1,7 +1,11 @@
 import json
 import math
+import base64
+import hashlib
 import threading
 import time
+import urllib.error
+import urllib.request
 
 from rclpy.clock import Clock, ClockType
 from lges_recipe_interfaces.msg import RecipeExecutionState
@@ -155,6 +159,8 @@ class BackendMqttPublisher:
         self.dynamic_service_clients = {}
         self.dynamic_service_in_flight = set()
         self.dynamic_enrich_jobs = {}
+        self.mir_rest_cache = {}
+        self.mir_rest_warning_logged = False
         self.query_json_missing_logged = False
         self.subscriptions = []
         self.time_sync_wait_logged = False
@@ -255,12 +261,14 @@ class BackendMqttPublisher:
         default_types = {
             str(topics.get("mir_state", "/mir/state")): "std_msgs/msg/String",
             str(topics.get("mir_errors", "/mir/errors_json")): "std_msgs/msg/String",
-            str(topics.get("mir_waypoints", "/mir/waypoints_json")): "std_msgs/msg/String",
             str(topics.get("mir_current_waypoint", "/mir/current_waypoint_json")): "std_msgs/msg/String",
             str(topics.get("mir_reached_waypoint", "/mir/reached_waypoint_json")): "std_msgs/msg/String",
             str(topics.get("system_safety_state", "/system/safety_state")): "std_msgs/msg/String",
             str(topics.get("recipe_state", "/recipe/state")): "lges_recipe_interfaces/msg/RecipeExecutionState",
         }
+        mir_waypoints_topic = topics.get("mir_waypoints")
+        if mir_waypoints_topic:
+            default_types[str(mir_waypoints_topic)] = "std_msgs/msg/String"
         for topic, ros_type in default_types.items():
             found.setdefault(topic, ros_type)
 
@@ -553,6 +561,9 @@ class BackendMqttPublisher:
         if source == "ros_service_dynamic":
             return self.resolve_dynamic_service_field(message_type, field_name, spec, context)
 
+        if source == "mir_rest_api":
+            return self.resolve_mir_rest_api_field(message_type, field_name, spec, context)
+
         if source == "derived" and spec.get("candidate_paths"):
             topic_payload = base
             if topic_payload is None and spec.get("ros_topic"):
@@ -630,8 +641,27 @@ class BackendMqttPublisher:
 
         item_mapping = spec.get("item_mapping") or {}
         required = spec.get("required_item_fields") or []
+        exclude_name_values = spec.get("exclude_item_names") or []
+        exclude_config_path = spec.get("exclude_item_names_config")
+        if not exclude_name_values and exclude_config_path:
+            exclude_name_values = self.get_config_path(exclude_config_path, []) or []
+        exclude_names = set(
+            _safe_text(name).lower()
+            for name in exclude_name_values
+            if _safe_text(name)
+        )
+        exclude_rules = spec.get("exclude_item_rules") or []
+        exclude_rules_config_path = spec.get("exclude_item_rules_config")
+        if not exclude_rules and exclude_rules_config_path:
+            exclude_rules = self.get_config_path(exclude_rules_config_path, []) or []
         output = []
         for idx, item in enumerate(values, start=1):
+            if isinstance(item, dict) and (exclude_names or exclude_rules):
+                item_name = _safe_text(item.get("name") or _get_path(item, "raw.name")).lower()
+                if item_name in exclude_names:
+                    continue
+                if self.matches_exclude_item_rules(item, exclude_rules):
+                    continue
             if not isinstance(item_mapping, dict) or not item_mapping:
                 output.append(item)
                 continue
@@ -640,6 +670,43 @@ class BackendMqttPublisher:
                 continue
             output.append(mapped)
         return output
+
+    def matches_exclude_item_rules(self, item, rules):
+        if not isinstance(item, dict) or not isinstance(rules, list):
+            return False
+        for rule in rules:
+            if self.matches_exclude_item_rule(item, rule):
+                return True
+        return False
+
+    def matches_exclude_item_rule(self, item, rule):
+        if not isinstance(rule, dict):
+            return False
+        aliases = {
+            "name": ["name", "raw.name"],
+            "guid": ["guid", "id", "raw.guid", "raw.id"],
+            "id": ["id", "guid", "raw.id", "raw.guid"],
+            "type_id": ["type_id", "typeId", "type", "raw.type_id", "raw.typeId", "raw.type"],
+            "typeId": ["type_id", "typeId", "type", "raw.type_id", "raw.typeId", "raw.type"],
+            "type": ["type", "type_id", "typeId", "raw.type", "raw.type_id", "raw.typeId"],
+            "parent_id": ["parent_id", "parentId", "parent", "raw.parent_id", "raw.parentId", "raw.parent"],
+            "parentId": ["parent_id", "parentId", "parent", "raw.parent_id", "raw.parentId", "raw.parent"],
+        }
+        has_criterion = False
+        for key, expected in rule.items():
+            if _is_empty_value(expected):
+                continue
+            has_criterion = True
+            paths = aliases.get(key, [key])
+            actual_values = [_get_path(item, path) for path in paths]
+            if not any(self.value_matches_rule(actual, expected) for actual in actual_values):
+                return False
+        return has_criterion
+
+    def value_matches_rule(self, actual, expected):
+        if isinstance(expected, list):
+            return any(self.value_matches_rule(actual, item) for item in expected)
+        return _safe_text(actual).lower() == _safe_text(expected).lower()
 
     def resolve_mapping_object(self, message_type, mapping, context, base, index):
         output = {}
@@ -661,7 +728,8 @@ class BackendMqttPublisher:
             "source", "field_path", "candidate_paths", "fallback", "fallback_pattern",
             "transform", "default", "value", "empty_value", "ros_topic", "config_path",
             "list_path", "list_paths", "item_mapping", "required_item_fields", "max_items",
-            "max_items_config",
+            "max_items_config", "exclude_item_names", "exclude_item_names_config",
+            "exclude_item_rules", "exclude_item_rules_config",
         }
         return any(key in spec for key in field_keys)
 
@@ -858,6 +926,104 @@ class BackendMqttPublisher:
         spec = job.get("spec", {}) or {}
         if bool(spec.get("publish_on_response", False)):
             self.publish_factsheet_now(force=True, reason=f"dynamic_query_ready:{cache_key}")
+
+    def resolve_mir_rest_api_field(self, message_type, field_name, spec, context):
+        request_spec = spec.get("request") or {}
+        path_template = str(request_spec.get("path_template") or request_spec.get("path") or "")
+        request_id = self.resolve_dynamic_request_id(request_spec, context)
+        if not path_template:
+            return spec.get("empty_value", _MISSING)
+        if "{id}" in path_template and not request_id:
+            return spec.get("empty_value", _MISSING)
+
+        api_path = path_template.format(id=request_id, mapId=request_id)
+        payload = self.mir_rest_get_json(api_path, spec)
+        if payload is _MISSING:
+            return spec.get("empty_value", _MISSING)
+
+        payload = self.enrich_mir_rest_items_if_needed(payload, spec)
+        if "list_paths" in spec or "list_path" in spec or "item_mapping" in spec:
+            return self.resolve_list_field(message_type, spec, context, payload)
+        return payload
+
+    def mir_rest_config(self):
+        return self.publisher_config.get("mir_rest", {}) or {}
+
+    def mir_rest_get_json(self, api_path, spec=None):
+        rest = self.mir_rest_config()
+        host = _safe_text(rest.get("host"))
+        if not host:
+            if not self.mir_rest_warning_logged:
+                self.node.get_logger().warn("MiR REST API host is not configured; factsheet API fields will stay empty.")
+                self.mir_rest_warning_logged = True
+            return _MISSING
+
+        cache_ttl = float(rest.get("cache_ttl_sec", 0.0) or 0.0)
+        cache_key = str(api_path)
+        cached = self.mir_rest_cache.get(cache_key)
+        if cached and cache_ttl > 0 and time.monotonic() - cached.get("at", 0.0) <= cache_ttl:
+            return cached.get("value")
+
+        scheme_host = host if str(host).startswith(("http://", "https://")) else f"http://{host}"
+        base_path = _safe_text(rest.get("base_path"), "/api/v2.0.0").rstrip("/")
+        path = str(api_path or "")
+        if not path.startswith("/"):
+            path = f"/{path}"
+        url = f"{scheme_host.rstrip('/')}{base_path}{path}"
+        timeout = float(rest.get("timeout_sec", 3.0) or 3.0)
+        request = urllib.request.Request(url, headers=self.mir_rest_headers(rest), method="GET")
+
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+            value = json.loads(raw) if raw else {}
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+            self.node.get_logger().warn(f"MiR REST API read failed ({path}): {exc}")
+            return _MISSING
+
+        self.mir_rest_cache[cache_key] = {"at": time.monotonic(), "value": value}
+        return value
+
+    def mir_rest_headers(self, rest):
+        username = _safe_text(rest.get("username"))
+        password = _safe_text(rest.get("password"))
+        if _safe_text(rest.get("password_hash_mode")).lower() == "sha256":
+            password = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        return {
+            "Content-Type": "application/json",
+            "Accept-Language": "ko_KR.utf8",
+            "Authorization": f"Basic {token}",
+        }
+
+    def enrich_mir_rest_items_if_needed(self, payload, spec):
+        enrich_spec = spec.get("enrich_items")
+        if not isinstance(enrich_spec, dict) or not isinstance(payload, list):
+            return payload
+
+        path_template = str(enrich_spec.get("path_template") or enrich_spec.get("path") or "")
+        if not path_template:
+            return payload
+
+        id_paths = enrich_spec.get("id_paths") or ["guid", "id"]
+        required_paths = enrich_spec.get("required_paths") or []
+        merge = bool(enrich_spec.get("merge", True))
+        output = []
+        for item in payload:
+            source = dict(item) if isinstance(item, dict) else {"value": item}
+            if required_paths and any(not _is_empty_value(_get_path(source, path)) for path in required_paths):
+                output.append(source)
+                continue
+            item_id = _first_path(source, id_paths)
+            if _is_empty_value(item_id):
+                output.append(source)
+                continue
+            detail = self.mir_rest_get_json(path_template.format(id=str(item_id)), spec)
+            if isinstance(detail, dict):
+                output.append({**source, **detail} if merge else detail)
+            else:
+                output.append(source)
+        return output
 
     def resolve_derived_field(self, field_name, spec, context, base=None):
         if field_name == "lastActionId":

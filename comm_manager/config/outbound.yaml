@@ -12,6 +12,18 @@ outbound:
     publish_when_mqtt_disconnected: false
     map_ver_no: 1
     max_factsheet_nodes: 300
+    position_exclude_names: []
+    position_exclude_rules:
+      - name: charger
+        type_id: 8
+    mir_rest:
+      host: 192.168.0.91
+      base_path: /api/v2.0.0
+      username: distributor
+      password: distributor
+      password_hash_mode: sha256
+      timeout_sec: 3.0
+      cache_ttl_sec: 5.0
     max_action_history: 50
     max_node_history: 200
     defaults:
@@ -21,7 +33,7 @@ outbound:
     topics:
       mir_state: /mir/state
       mir_errors: /mir/errors_json
-      mir_waypoints: /mir/waypoints_json
+      mir_waypoints: null
       mir_current_waypoint: /mir/current_waypoint_json
       mir_reached_waypoint: /mir/reached_waypoint_json
       system_safety_state: /system/safety_state
