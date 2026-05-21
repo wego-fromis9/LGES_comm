@@ -2,6 +2,7 @@ import json
 import math
 import time
 
+from rclpy.clock import Clock, ClockType
 from lges_recipe_interfaces.msg import RecipeExecutionState
 from lges_recipe_interfaces.srv import QueryRecipeList
 from std_msgs.msg import String
@@ -99,10 +100,17 @@ class BackendMqttPublisher:
         self.last_pose_sample = None
         self.last_state_header_id = None
         self.last_factsheet_signature = ""
+        self.time_sync_wait_logged = False
+        self.recipe_list_loaded = False
+        self.pending_factsheet_publish = False
+        self.pending_factsheet_force = False
+        self.pending_factsheet_reason = ""
+        self.recipe_query_unavailable_logged = False
 
         self.state_pub = None
         self.recipe_query_client = None
         self.timers = []
+        self.timer_clock = getattr(node, "steady_clock", None) or Clock(clock_type=ClockType.STEADY_TIME)
 
         if self.enabled:
             self.start()
@@ -158,6 +166,7 @@ class BackendMqttPublisher:
             self.timers.append(self.node.create_timer(
                 float(state_cfg.get("period_sec", 1.0)),
                 self.publish_state_tick,
+                clock=self.timer_clock,
             ))
 
         visualization_cfg = self.outbound_config.get("visualization", {}) or {}
@@ -165,6 +174,7 @@ class BackendMqttPublisher:
             self.timers.append(self.node.create_timer(
                 float(visualization_cfg.get("period_sec", 1.0)),
                 self.publish_visualization_tick,
+                clock=self.timer_clock,
             ))
 
         factsheet_cfg = self.outbound_config.get("factsheet", {}) or {}
@@ -172,11 +182,13 @@ class BackendMqttPublisher:
             self.timers.append(self.node.create_timer(
                 float(factsheet_cfg.get("check_period_sec", 5.0)),
                 self.publish_factsheet_tick,
+                clock=self.timer_clock,
             ))
             if bool(factsheet_cfg.get("publish_on_start", True)):
                 self.timers.append(self.node.create_timer(
                     float(factsheet_cfg.get("initial_delay_sec", 3.0)),
                     self.publish_initial_factsheet_once,
+                    clock=self.timer_clock,
                 ))
 
         self.node.get_logger().info(
@@ -257,8 +269,27 @@ class BackendMqttPublisher:
     def publish_factsheet(self, force=False, reason="request"):
         if not self.can_publish_factsheet() or not self.should_publish_mqtt():
             return False, "backend factsheet publisher is not ready"
+
+        if self.should_wait_recipe_list_before_factsheet():
+            self.pending_factsheet_publish = True
+            self.pending_factsheet_force = bool(self.pending_factsheet_force or force)
+            self.pending_factsheet_reason = str(reason or self.pending_factsheet_reason or "recipe_list_ready")
+            self.refresh_recipe_list_if_needed(force=True)
+            self.node.get_logger().info("Factsheet 발행 대기: recipe list 조회 후 발행합니다.")
+            return True, "factsheet pending recipe list"
+
+        self.refresh_recipe_list_if_needed()
+        return self.publish_factsheet_now(force=force, reason=reason)
+
+    def should_wait_recipe_list_before_factsheet(self):
+        if self.recipe_list_loaded:
+            return False
+        if bool(self.recipe_query_in_flight):
+            return True
+        return bool(self.publisher_config.get("require_recipe_list_before_factsheet", True))
+
+    def publish_factsheet_now(self, force=False, reason="request"):
         try:
-            self.refresh_recipe_list_if_needed()
             payload = self.build_factsheet_payload()
             signature = json.dumps({
                 "nodeCount": len(payload.get("nodes", [])),
@@ -278,7 +309,44 @@ class BackendMqttPublisher:
     def should_publish_mqtt(self):
         if bool(self.publisher_config.get("publish_when_mqtt_disconnected", False)):
             return True
-        return bool(getattr(self.mqtt_core, "connected", False))
+        if not bool(getattr(self.mqtt_core, "connected", False)):
+            return False
+
+        time_sync_config = self.config.get("time_sync", {}) or {}
+        broker_config = time_sync_config.get("broker_topic", {}) or {}
+        require_time_sync = bool(
+            broker_config.get(
+                "require_before_outbound_publish",
+                self.publisher_config.get("require_time_sync_before_publish", False)
+            )
+        )
+        if not require_time_sync:
+            self.time_sync_wait_logged = False
+            return True
+
+        source = str(time_sync_config.get("source", "") or "").strip().lower()
+        broker_enabled = bool(
+            broker_config.get("enabled", source in ("broker", "broker_topic", "mqtt"))
+        )
+        if not broker_enabled:
+            self.time_sync_wait_logged = False
+            return True
+
+        time_ready = (
+            self.mqtt_core.broker_time_ready_for_outbound()
+            if hasattr(self.mqtt_core, "broker_time_ready_for_outbound")
+            else self.mqtt_core.broker_time_is_synced()
+        )
+        if time_ready:
+            self.time_sync_wait_logged = False
+            return True
+
+        if not self.time_sync_wait_logged:
+            self.node.get_logger().info(
+                "Backend MQTT publish 대기: broker timeSync 수신/OS 시간 설정 전입니다."
+            )
+            self.time_sync_wait_logged = True
+        return False
 
     def publish_canonical_state(self, payload):
         if self.state_pub is None:
@@ -516,19 +584,33 @@ class BackendMqttPublisher:
             {"actionId": "ACT_REQUEST_FACTSHEET", "actionType": "request_factsheet", "actionParamList": []},
         ]
 
-    def refresh_recipe_list_if_needed(self):
+    def refresh_recipe_list_if_needed(self, force=False):
         refresh_sec = float(self.publisher_config.get("recipe_list_refresh_sec", 5.0))
-        if self.recipe_query_in_flight or time.monotonic() - self.recipe_list_fetched_at < refresh_sec:
-            return
-        if not self.recipe_query_client or not self.recipe_query_client.service_is_ready():
+        if self.recipe_query_in_flight:
+            return False
+        if not force and time.monotonic() - self.recipe_list_fetched_at < refresh_sec:
+            return False
+        wait_sec = float(self.publisher_config.get("recipe_query_service_wait_sec", 0.2) or 0.0)
+        service_ready = (
+            self.recipe_query_client is not None
+            and self.recipe_query_client.wait_for_service(timeout_sec=wait_sec)
+        )
+        if not service_ready:
             self.recipe_list_fetched_at = time.monotonic()
-            return
+            if not self.recipe_query_unavailable_logged:
+                self.node.get_logger().warn(
+                    "Recipe list service is not ready; factsheet recipe list will stay pending."
+                )
+                self.recipe_query_unavailable_logged = True
+            return False
 
         request = QueryRecipeList.Request()
         request.include_details = True
         self.recipe_query_in_flight = True
+        self.recipe_query_unavailable_logged = False
         future = self.recipe_query_client.call_async(request)
         future.add_done_callback(self.on_recipe_list_response)
+        return True
 
     def on_recipe_list_response(self, future):
         self.recipe_query_in_flight = False
@@ -559,3 +641,13 @@ class BackendMqttPublisher:
                 "actionDescription": label,
             })
         self.recipe_action_list = normalized
+        self.recipe_list_loaded = True
+        self.node.get_logger().info(f"Recipe list loaded for factsheet: {len(normalized)} recipes")
+
+        if self.pending_factsheet_publish:
+            force = self.pending_factsheet_force
+            reason = self.pending_factsheet_reason or "recipe_list_ready"
+            self.pending_factsheet_publish = False
+            self.pending_factsheet_force = False
+            self.pending_factsheet_reason = ""
+            self.publish_factsheet_now(force=force, reason=reason)

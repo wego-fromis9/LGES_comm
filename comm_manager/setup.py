@@ -28,8 +28,7 @@ setup(
         'console_scripts': [
             # ⭐️ comm_node.py의 main 함수를 'comm_node'라는 이름으로 실행 가능하게 등록
             'comm_node = comm_manager.comm_node:main',
-            'comm_trigger_ack_server = comm_manager.trigger_ack_server:main',
-            'apply_host_setup = comm_manager.host_setup:main'
+            'comm_trigger_ack_server = comm_manager.trigger_ack_server:main'
         ],
     },
 )

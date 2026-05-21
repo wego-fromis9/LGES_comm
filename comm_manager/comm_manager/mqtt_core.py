@@ -1,6 +1,7 @@
 import json
 import os
 import ssl
+import subprocess
 import time
 import threading
 from copy import deepcopy
@@ -11,6 +12,7 @@ from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 
 from ament_index_python.packages import get_package_share_directory
+from .broker_time_sync import parse_timestamp_value, select_timestamp_value
 
 class MqttCore:
     def __init__(self, config, logger):
@@ -39,6 +41,56 @@ class MqttCore:
         self.timestamp_use_z_suffix_for_utc = bool(
             self.timestamp_config.get('use_z_suffix_for_utc', True)
         )
+        self.time_sync_config = config.get('time_sync', {}) or {}
+        self.time_sync_apply_config = self.time_sync_config.get('apply', {}) or {}
+        self.broker_time_config = self.time_sync_config.get('broker_topic', {}) or {}
+        self.time_sync_source = str(self.time_sync_config.get('source', 'system') or 'system').strip().lower()
+        self.broker_time_sync_enabled = bool(
+            self.broker_time_config.get(
+                'enabled',
+                self.time_sync_source in ('broker', 'broker_topic', 'mqtt')
+            )
+        )
+        self.broker_time_topic = self._resolve_broker_time_topic()
+        self.broker_time_timestamp_field = str(
+            self.broker_time_config.get('timestamp_field', 'timestamp') or 'timestamp'
+        )
+        self.broker_time_qos = int(self.broker_time_config.get('qos', self.inbound_qos) or 0)
+        self.broker_time_accept_retained = bool(self.broker_time_config.get('accept_retained', False))
+        self.broker_time_max_offset_sec = float(self.broker_time_config.get('max_offset_sec', 86400.0))
+        self.broker_time_stale_after_sec = float(self.broker_time_config.get('stale_after_sec', 300.0))
+        self.broker_time_log_every_update = bool(self.broker_time_config.get('log_every_update', False))
+        self.apply_mqtt_payload_timestamp = bool(
+            self.time_sync_apply_config.get('mqtt_payload_timestamp', True)
+        )
+        self.system_clock_config = self.time_sync_config.get('system_clock', {}) or {}
+        self.system_clock_enabled = bool(
+            self.time_sync_apply_config.get(
+                'system_clock',
+                self.system_clock_config.get('enabled', False)
+            )
+        )
+        self.system_clock_command = str(
+            self.system_clock_config.get('command')
+            or "sudo -n date -u --set '{timestamp}'"
+        )
+        self.system_clock_min_offset_sec = float(self.system_clock_config.get('min_offset_sec', 1.0))
+        self.system_clock_max_offset_sec = float(
+            self.system_clock_config.get('max_offset_sec', self.broker_time_max_offset_sec)
+        )
+        self.system_clock_cooldown_sec = float(self.system_clock_config.get('cooldown_sec', 30.0))
+        self.system_clock_apply_once = bool(self.system_clock_config.get('apply_once', True))
+        self.system_clock_timeout_sec = float(self.system_clock_config.get('timeout_sec', 5.0))
+        self.system_clock_dry_run = bool(self.system_clock_config.get('dry_run', False))
+        self.system_clock_last_apply_at = 0.0
+        self.system_clock_applied = False
+        self.system_clock_ready_for_outbound = not self.system_clock_enabled
+        self.broker_time_offset_sec = 0.0
+        self.broker_time_updated_at = 0.0
+        self.broker_time_remote_timestamp = ""
+        self.broker_time_last_state = ""
+        self.broker_time_lock = threading.Lock()
+        self.broker_time_event = threading.Event()
         
         self.header_id_counter = 1
         self.connected = False
@@ -61,6 +113,7 @@ class MqttCore:
         self.on_connect_callback = None
         self.on_disconnect_callback = None
         self.on_message_callback = None
+        self.on_time_sync_callback = None
 
         self.client.on_connect = self._internal_on_connect
         self.client.on_disconnect = self._internal_on_disconnect
@@ -135,6 +188,62 @@ class MqttCore:
                 properties=self._will_properties()
             )
 
+    def _resolve_broker_time_topic(self):
+        if not self.broker_time_sync_enabled:
+            return ""
+
+        explicit_topic = str(
+            self.broker_time_config.get('topic')
+            or self.broker_time_config.get('absolute_topic')
+            or ''
+        ).strip().strip('/')
+        if explicit_topic:
+            return explicit_topic
+
+        suffix = str(self.broker_time_config.get('topic_suffix', 'timeSync') or 'timeSync')
+        suffix = suffix.strip().strip('/')
+        if not suffix:
+            return ""
+        return f"{self.base_topic}/{suffix}"
+
+    def is_broker_time_topic(self, topic):
+        if not self.broker_time_sync_enabled or not self.broker_time_topic:
+            return False
+        topic_text = str(topic or '').strip().strip('/')
+        configured = str(self.broker_time_topic or '').strip().strip('/')
+        if topic_text == configured:
+            return True
+        try:
+            return mqtt.topic_matches_sub(configured, topic_text)
+        except Exception:
+            return False
+
+    def subscribe_broker_time_topic(self, client):
+        if not self.broker_time_sync_enabled or not self.broker_time_topic:
+            return
+        client.subscribe(self.broker_time_topic, qos=self.broker_time_qos)
+        selector = {
+            "mode": self.broker_time_config.get("payload_mode", "id_selector"),
+            "list_path": self.broker_time_config.get("list_path", "timestamps"),
+            "id_field": self.broker_time_config.get("id_field", "id"),
+            "selected_id": self.broker_time_config.get("selected_id", "control"),
+            "timestamp_field": self.broker_time_config.get("timestamp_field", "timestamp"),
+        }
+        self.logger.info(
+            f"MQTT broker time sync 구독 완료: "
+            f"[{self.broker_time_topic}], selector={selector}"
+        )
+
+    def reset_broker_time_sync_state(self):
+        if not self.broker_time_sync_enabled:
+            return
+        with self.broker_time_lock:
+            self.broker_time_offset_sec = 0.0
+            self.broker_time_updated_at = 0.0
+            self.broker_time_remote_timestamp = ""
+            self.broker_time_event.clear()
+        self.system_clock_ready_for_outbound = not self.system_clock_enabled
+
     def connect(self):
         with self.connection_lock:
             try:
@@ -187,37 +296,57 @@ class MqttCore:
 
     def _internal_on_connect(self, client, userdata, flags, rc, properties=None):
         self.connected = (rc == 0)
-        if self.on_connect_callback:
-            self.on_connect_callback(rc)
 
         # Host(관제 시스템) → 로봇 방향의 명령 토픽 구독
         # '+' 와일드카드: manufacturer, serial_number 값에 무관하게 수신
         if rc == 0:
+            self.reset_broker_time_sync_state()
             client.subscribe(f"{self.base_topic}/order", qos=self.inbound_qos)
             client.subscribe(f"{self.base_topic}/instantActions", qos=self.inbound_qos)
+            self.subscribe_broker_time_topic(client)
             self.logger.info(
                 f"MQTT 명령 구독 완료: "
                 f"[{self.base_topic}/order], "
                 f"[{self.base_topic}/instantActions]"
             )
 
+        if self.on_connect_callback:
+            self.on_connect_callback(rc)
 
     def _internal_on_disconnect(self, client, userdata, rc, properties=None):
         self.connected = False
         if self.on_disconnect_callback: self.on_disconnect_callback(rc)
             
     def _internal_on_message(self, client, userdata, msg):
-        if self.on_message_callback:
-            try:
-                payload = json.loads(msg.payload.decode('utf-8'))
-                self._dispatch_message_callback(msg.topic, payload)
-            except json.JSONDecodeError:
-                raw_payload = msg.payload.decode('utf-8', errors='replace')
+        try:
+            raw_payload = msg.payload.decode('utf-8')
+        except Exception:
+            raw_payload = msg.payload.decode('utf-8', errors='replace')
+
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            if self.is_broker_time_topic(msg.topic):
+                self.handle_broker_time_payload(
+                    msg.topic,
+                    {"_comm_parse_error": f"invalid JSON format: {raw_payload}"},
+                    bool(getattr(msg, 'retain', False)),
+                )
+                return
+            if self.on_message_callback:
                 error_message = f"invalid JSON format: {raw_payload}"
                 self.logger.warn(f"JSON 파싱 실패 (토픽: {msg.topic})")
                 self._dispatch_message_callback(msg.topic, {
                     "_comm_parse_error": error_message
                 })
+            return
+
+        if self.is_broker_time_topic(msg.topic):
+            self.handle_broker_time_payload(msg.topic, payload, bool(getattr(msg, 'retain', False)))
+            return
+
+        if self.on_message_callback:
+            self._dispatch_message_callback(msg.topic, payload)
 
     def _dispatch_message_callback(self, topic, payload):
         threading.Thread(
@@ -226,6 +355,270 @@ class MqttCore:
             daemon=True,
             name=f"mqtt-message-{str(topic).rstrip('/').split('/')[-1] or 'payload'}"
         ).start()
+
+    def handle_broker_time_payload(self, topic, payload, retained=False):
+        if retained and not self.broker_time_accept_retained:
+            self.report_broker_time_state(
+                "IGNORED_RETAINED",
+                f"retained broker time message ignored: {topic}",
+                topic=topic,
+            )
+            return False
+
+        if not isinstance(payload, dict):
+            self.report_broker_time_state(
+                "ERROR",
+                "broker time payload must be a JSON object",
+                topic=topic,
+            )
+            return False
+
+        if payload.get("_comm_parse_error"):
+            self.report_broker_time_state(
+                "ERROR",
+                str(payload.get("_comm_parse_error")),
+                topic=topic,
+            )
+            return False
+
+        timestamp_value, selection = select_timestamp_value(payload, self.broker_time_config)
+        if timestamp_value in (None, ""):
+            self.report_broker_time_state(
+                "ERROR",
+                "broker time timestamp not found by configured selector",
+                topic=topic,
+                selection=selection,
+            )
+            return False
+
+        local_received = datetime.now(timezone.utc)
+        try:
+            broker_time = parse_timestamp_value(timestamp_value)
+        except Exception as exc:
+            self.report_broker_time_state(
+                "ERROR",
+                f"broker time parse failed: {exc}",
+                topic=topic,
+            )
+            return False
+
+        offset_sec = (broker_time - local_received).total_seconds()
+        if abs(offset_sec) > self.broker_time_max_offset_sec:
+            self.report_broker_time_state(
+                "REJECTED",
+                (
+                    f"broker time offset too large: offset={offset_sec:.3f}s, "
+                    f"max={self.broker_time_max_offset_sec:.3f}s"
+                ),
+                topic=topic,
+                broker_timestamp=broker_time.isoformat(),
+                offset_sec=offset_sec,
+                selection=selection,
+            )
+            return False
+
+        with self.broker_time_lock:
+            self.broker_time_offset_sec = offset_sec
+            self.broker_time_updated_at = time.monotonic()
+            self.broker_time_remote_timestamp = broker_time.isoformat()
+            self.broker_time_event.set()
+
+        self.report_broker_time_state(
+            "SYNCED",
+            f"broker time synced: offset={offset_sec:.3f}s",
+            topic=topic,
+            broker_timestamp=broker_time.isoformat(),
+            offset_sec=offset_sec,
+            selection=selection,
+        )
+        if not self.system_clock_enabled:
+            self.system_clock_ready_for_outbound = True
+        self.apply_system_clock_if_configured(topic, broker_time, offset_sec, selection)
+        return True
+
+    def apply_system_clock_if_configured(self, topic, broker_time, offset_sec, selection=None):
+        if not self.system_clock_enabled:
+            self.system_clock_ready_for_outbound = True
+            return False
+
+        abs_offset = abs(float(offset_sec))
+        if abs_offset < self.system_clock_min_offset_sec:
+            self.system_clock_ready_for_outbound = True
+            self.report_broker_time_state(
+                "SYSTEM_CLOCK_SKIPPED",
+                f"system clock apply skipped: offset {offset_sec:.3f}s < min {self.system_clock_min_offset_sec:.3f}s",
+                topic=topic,
+                broker_timestamp=broker_time.isoformat(),
+                offset_sec=offset_sec,
+                selection=selection,
+            )
+            return False
+
+        if abs_offset > self.system_clock_max_offset_sec:
+            self.system_clock_ready_for_outbound = False
+            self.report_broker_time_state(
+                "SYSTEM_CLOCK_REJECTED",
+                f"system clock apply rejected: offset {offset_sec:.3f}s > max {self.system_clock_max_offset_sec:.3f}s",
+                topic=topic,
+                broker_timestamp=broker_time.isoformat(),
+                offset_sec=offset_sec,
+                selection=selection,
+            )
+            return False
+
+        now_monotonic = time.monotonic()
+        if self.system_clock_apply_once and self.system_clock_applied:
+            self.system_clock_ready_for_outbound = True
+            self.report_broker_time_state(
+                "SYSTEM_CLOCK_SKIPPED",
+                "system clock apply skipped: already applied once",
+                topic=topic,
+                broker_timestamp=broker_time.isoformat(),
+                offset_sec=offset_sec,
+                selection=selection,
+            )
+            return False
+
+        if (
+            self.system_clock_last_apply_at > 0
+            and (now_monotonic - self.system_clock_last_apply_at) < self.system_clock_cooldown_sec
+        ):
+            self.system_clock_ready_for_outbound = True
+            self.report_broker_time_state(
+                "SYSTEM_CLOCK_SKIPPED",
+                "system clock apply skipped: cooldown active",
+                topic=topic,
+                broker_timestamp=broker_time.isoformat(),
+                offset_sec=offset_sec,
+                selection=selection,
+            )
+            return False
+
+        timestamp = broker_time.astimezone(timezone.utc).replace(microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ')
+        command = self.system_clock_command.format(timestamp=timestamp)
+        if self.system_clock_dry_run:
+            self.system_clock_last_apply_at = now_monotonic
+            self.system_clock_ready_for_outbound = True
+            self.report_broker_time_state(
+                "SYSTEM_CLOCK_DRY_RUN",
+                f"system clock dry-run command: {command}",
+                topic=topic,
+                broker_timestamp=broker_time.isoformat(),
+                offset_sec=offset_sec,
+                selection=selection,
+            )
+            return True
+
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                text=True,
+                capture_output=True,
+                timeout=self.system_clock_timeout_sec,
+                check=False,
+            )
+        except Exception as exc:
+            self.system_clock_ready_for_outbound = False
+            self.report_broker_time_state(
+                "SYSTEM_CLOCK_ERROR",
+                f"system clock command failed: {exc}",
+                topic=topic,
+                broker_timestamp=broker_time.isoformat(),
+                offset_sec=offset_sec,
+                selection=selection,
+            )
+            return False
+
+        output = (result.stdout or result.stderr or "").strip()
+        if result.returncode != 0:
+            self.system_clock_ready_for_outbound = False
+            self.report_broker_time_state(
+                "SYSTEM_CLOCK_ERROR",
+                f"system clock command returned {result.returncode}: {output}",
+                topic=topic,
+                broker_timestamp=broker_time.isoformat(),
+                offset_sec=offset_sec,
+                selection=selection,
+            )
+            return False
+
+        self.system_clock_last_apply_at = now_monotonic
+        self.system_clock_applied = True
+        self.system_clock_ready_for_outbound = True
+        with self.broker_time_lock:
+            self.broker_time_offset_sec = 0.0
+            self.broker_time_updated_at = time.monotonic()
+
+        self.report_broker_time_state(
+            "SYSTEM_CLOCK_SYNCED",
+            f"system clock synced by broker timestamp: {timestamp}",
+            topic=topic,
+            broker_timestamp=broker_time.isoformat(),
+            offset_sec=0.0,
+            selection=selection,
+        )
+        return True
+
+    def report_broker_time_state(self, state, message, **extra):
+        state_key = str(state or "UNKNOWN").upper()
+        if state_key != self.broker_time_last_state or self.broker_time_log_every_update:
+            if state_key in {
+                "SYNCED",
+                "SYSTEM_CLOCK_SYNCED",
+                "SYSTEM_CLOCK_SKIPPED",
+                "SYSTEM_CLOCK_DRY_RUN",
+            }:
+                self.logger.info(message)
+            elif state_key in {"ERROR", "REJECTED", "SYSTEM_CLOCK_ERROR", "SYSTEM_CLOCK_REJECTED"}:
+                self.logger.error(message)
+            else:
+                self.logger.warn(message)
+            self.broker_time_last_state = state_key
+
+        if self.on_time_sync_callback:
+            payload = {
+                "source": "broker_topic",
+                "state": state_key,
+                "message": str(message or ""),
+                "topic": extra.get("topic", self.broker_time_topic),
+                "timestampField": self.broker_time_timestamp_field,
+                "offsetSec": extra.get("offset_sec"),
+                "brokerTimestamp": extra.get("broker_timestamp", ""),
+                "selection": extra.get("selection"),
+                "updatedAtMonotonic": self.broker_time_updated_at,
+            }
+            try:
+                self.on_time_sync_callback(payload)
+            except Exception as exc:
+                self.logger.warn(f"broker time sync state callback failed: {exc}")
+
+    def broker_time_is_synced(self):
+        if not self.broker_time_sync_enabled:
+            return False
+        with self.broker_time_lock:
+            updated_at = self.broker_time_updated_at
+        if updated_at <= 0:
+            return False
+        if self.broker_time_stale_after_sec <= 0:
+            return True
+        return (time.monotonic() - updated_at) <= self.broker_time_stale_after_sec
+
+    def broker_time_ready_for_outbound(self):
+        if not self.broker_time_sync_enabled:
+            return True
+        if not self.broker_time_is_synced():
+            return False
+        if self.system_clock_enabled and not self.system_clock_ready_for_outbound:
+            return False
+        return True
+
+    def wait_for_time_sync(self, timeout_sec):
+        if not self.broker_time_sync_enabled:
+            return True
+        if self.broker_time_is_synced():
+            return True
+        return self.broker_time_event.wait(max(float(timeout_sec or 0), 0.0))
 
     def _resolve_timestamp_timezone(self):
         configured = str(self.timestamp_config.get('timezone', 'UTC') or 'UTC').strip()
@@ -245,7 +638,15 @@ class MqttCore:
             return timezone.utc
 
     def current_timestamp(self):
-        if self.timestamp_timezone is None:
+        if self.apply_mqtt_payload_timestamp and self.broker_time_is_synced():
+            with self.broker_time_lock:
+                offset_sec = self.broker_time_offset_sec
+            now_utc = datetime.now(timezone.utc) + timedelta(seconds=offset_sec)
+            if self.timestamp_timezone is None:
+                now = now_utc.astimezone()
+            else:
+                now = now_utc.astimezone(self.timestamp_timezone)
+        elif self.timestamp_timezone is None:
             now = datetime.now().astimezone()
         else:
             now = datetime.now(self.timestamp_timezone)

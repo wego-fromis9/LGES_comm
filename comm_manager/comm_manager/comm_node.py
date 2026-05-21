@@ -10,9 +10,11 @@ import threading
 import signal
 
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from std_srvs.srv import Trigger
+from std_msgs.msg import String
 from lges_recipe_interfaces.srv import RunRecipe, SendInstantAction
 
 # 커스텀 인터페이스 로드
@@ -23,7 +25,6 @@ from comm_interfaces.srv import GetMqttJsonTemplates, PublishMqttJson, TriggerRe
 from .wifi_core import WifiCore
 from .mqtt_core import MqttCore
 from .payload_validator import InboundPayloadValidator
-from .ntp_monitor import NtpMonitor
 from .backend_publisher import BackendMqttPublisher
 
 from ament_index_python.packages import get_package_share_directory
@@ -98,6 +99,7 @@ def acquire_single_instance_lock(config):
 class CommNode(Node):
     def __init__(self):
         super().__init__('comm_node')
+        self.steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.config_path = ""
         
         # [1] 설정 파일 로드
@@ -114,9 +116,12 @@ class CommNode(Node):
         self.mqtt_core.on_connect_callback = self.on_mqtt_connect
         self.mqtt_core.on_disconnect_callback = self.on_mqtt_disconnect
         self.mqtt_core.on_message_callback = self.on_mqtt_message
+        self.mqtt_core.on_time_sync_callback = self.on_broker_time_sync
         
         # [4] ROS 2 인터페이스 세팅
         self.state_pub = self.create_publisher(ConnectionState, '/connection_state', 10)
+        time_sync_topic = str(self.config.get('time_sync', {}).get('ros_state_topic', '/comm/time_sync_state'))
+        self.time_sync_pub = self.create_publisher(String, time_sync_topic, 10)
         self.reconnect_srv = self.create_service(TriggerReconnect, '/trigger_reconnect', self.srv_reconnect_cb)
         self.publish_mqtt_srv = self.create_service(
             PublishMqttJson,
@@ -134,6 +139,8 @@ class CommNode(Node):
         self.active_ssid = ""
         self.signal_level = 0
         self.signal_status = "Disconnected"
+        self.last_time_sync_state_payload = None
+        self.time_sync_state_lock = threading.Lock()
         self.is_shutting_down = False
         self.connection_lock = threading.Lock()
         self.connection_thread = None
@@ -162,7 +169,9 @@ class CommNode(Node):
             self.order_sequence_config.get('require_monotonic_update_id', True)
         )
         self.order_deduplicate = bool(self.order_sequence_config.get('deduplicate', True))
+        self.order_sequence_lock = threading.Lock()
         self.order_history = {}
+        self.order_inflight = {}
         self.order_client = self.create_client(RunRecipe, self.order_service_name)
         self.instant_action_config = self.inbound_config.get('instant_actions', {}) or {}
         self.instant_action_enabled = bool(self.instant_action_config.get('enabled', True))
@@ -184,11 +193,20 @@ class CommNode(Node):
         self.visualization_retained_clear_sent = False
         self.backend_publisher = BackendMqttPublisher(self, self.mqtt_core, self.config)
         self.retained_policy_config = self.config.get('mqtt', {}).get('retained', {}) or {}
-        self.ntp_monitor = NtpMonitor(self.config, self.config_path, self.get_logger())
-        self.ntp_monitor.start()
+        time_sync_config = self.config.get('time_sync', {}) or {}
+        self.time_sync_ros_state_publish_period_sec = float(
+            time_sync_config.get('ros_state_publish_period_sec', 1.0) or 0.0
+        )
         
         # [5] UI용 상태 퍼블리시 타이머 (1초 주기)
-        self.timer = self.create_timer(1.0, self.publish_ros_state)
+        self.timer = self.create_timer(1.0, self.publish_ros_state, clock=self.steady_clock)
+        self.time_sync_state_timer = None
+        if self.time_sync_ros_state_publish_period_sec > 0:
+            self.time_sync_state_timer = self.create_timer(
+                self.time_sync_ros_state_publish_period_sec,
+                self.publish_last_time_sync_state,
+                clock=self.steady_clock
+            )
         
         # [6] 메인 백그라운드 스레드 시작
         threading.Thread(target=self.main_control_loop, daemon=True).start()
@@ -262,7 +280,6 @@ class CommNode(Node):
 
         try:
             self.comm_state = "CONNECTING"
-            self.sync_time_for_connection(reason or "MQTT connect")
             
             if self.manage_wifi:
                 wifi_ok = self.wifi_core.connect_initial()
@@ -296,32 +313,6 @@ class CommNode(Node):
         finally:
             self.connection_lock.release()
 
-    def sync_time_for_connection(self, reason):
-        if not hasattr(self, 'ntp_monitor') or not self.ntp_monitor:
-            return
-        if not self.ntp_monitor.enabled():
-            return
-
-        monitor_config = self.ntp_monitor.monitor_config
-        reason_text = str(reason or "").lower()
-        run_makestep = bool(monitor_config.get("run_makestep_on_mqtt_connect", False))
-        if "manual" in reason_text or "ui" in reason_text:
-            run_makestep = bool(monitor_config.get("run_makestep_on_manual_reconnect", run_makestep))
-
-        check_after = bool(monitor_config.get("check_on_mqtt_connect", True))
-        if not run_makestep and not check_after:
-            return
-
-        self.get_logger().info(
-            f"NTP sync check before MQTT connection ({reason}); "
-            f"makestep={'true' if run_makestep else 'false'}"
-        )
-        self.ntp_monitor.sync_now(
-            reason=f"mqtt_connection:{reason}",
-            run_makestep=run_makestep,
-            check_after=check_after,
-        )
-
     # ==========================================
     # [업그레이드 1] Graceful Shutdown (노드 종료 시 단절 알림)
     # ==========================================
@@ -331,9 +322,6 @@ class CommNode(Node):
         self.comm_state = "DISCONNECTED"
         
         try:
-            if hasattr(self, 'ntp_monitor') and self.ntp_monitor:
-                self.ntp_monitor.stop()
-
             try:
                 self.timer.cancel()
             except Exception:
@@ -393,6 +381,23 @@ class CommNode(Node):
         
         if self.comm_state == "CONNECTION FAILED":
             self.timer.cancel() 
+
+    def on_broker_time_sync(self, state_payload):
+        with self.time_sync_state_lock:
+            self.last_time_sync_state_payload = dict(state_payload or {})
+        self.publish_time_sync_state_payload(state_payload)
+
+    def publish_last_time_sync_state(self):
+        with self.time_sync_state_lock:
+            payload = dict(self.last_time_sync_state_payload or {})
+        if not payload:
+            return
+        self.publish_time_sync_state_payload(payload)
+
+    def publish_time_sync_state_payload(self, state_payload):
+        msg = String()
+        msg.data = json.dumps(state_payload or {}, ensure_ascii=False)
+        self.time_sync_pub.publish(msg)
 
     def create_inbound_trigger_clients(self):
         clients = {}
@@ -481,11 +486,13 @@ class CommNode(Node):
         future.add_done_callback(lambda _future: done.set())
 
         if not done.wait(timeout=self.inbound_service_timeout_sec):
+            self.clear_order_inflight(payload)
             return False, f"service timeout: {self.order_service_name}", "service_timeout"
 
         try:
             result = future.result()
         except Exception as e:
+            self.clear_order_inflight(payload)
             return False, f"service exception: {e}", "service_exception"
 
         accepted = bool(getattr(result, 'accepted', False))
@@ -500,6 +507,7 @@ class CommNode(Node):
         reason = self.run_recipe_result_reason(result, message)
         if accepted:
             self.remember_order(payload)
+        self.clear_order_inflight(payload)
         return accepted, summary, reason
 
     def order_payload_hash(self, payload):
@@ -526,29 +534,42 @@ class CommNode(Node):
         if update_id < 0:
             return False, "invalid orderUpdateId: must be >= 0", False
 
-        previous = self.order_history.get(order_id)
-        if not previous:
-            return True, "", False
-
-        previous_update_id = int(previous.get("orderUpdateId", -1))
         payload_hash = self.order_payload_hash(payload)
-        previous_hash = previous.get("payloadHash")
+        order_key = (order_id, update_id)
+        with self.order_sequence_lock:
+            inflight_hash = self.order_inflight.get(order_key)
+            if inflight_hash:
+                if self.order_deduplicate and payload_hash == inflight_hash:
+                    return True, f"duplicate in-flight order ignored: orderId={order_id}, orderUpdateId={update_id}", True
+                return False, (
+                    f"conflicting in-flight orderUpdateId: orderId={order_id}, "
+                    f"orderUpdateId={update_id}"
+                ), False
 
-        if update_id == previous_update_id:
-            if self.order_deduplicate and payload_hash == previous_hash:
-                return True, f"duplicate order ignored: orderId={order_id}, orderUpdateId={update_id}", True
-            return False, (
-                f"non-monotonic orderUpdateId: orderId={order_id}, "
-                f"received={update_id}, previous={previous_update_id}"
-            ), False
+            previous = self.order_history.get(order_id)
+            if not previous:
+                self.order_inflight[order_key] = payload_hash
+                return True, "", False
 
-        if self.order_require_monotonic_update_id and update_id < previous_update_id:
-            return False, (
-                f"non-monotonic orderUpdateId: orderId={order_id}, "
-                f"received={update_id}, previous={previous_update_id}"
-            ), False
+            previous_update_id = int(previous.get("orderUpdateId", -1))
+            previous_hash = previous.get("payloadHash")
 
-        return True, "", False
+            if update_id == previous_update_id:
+                if self.order_deduplicate and payload_hash == previous_hash:
+                    return True, f"duplicate order ignored: orderId={order_id}, orderUpdateId={update_id}", True
+                return False, (
+                    f"non-monotonic orderUpdateId: orderId={order_id}, "
+                    f"received={update_id}, previous={previous_update_id}"
+                ), False
+
+            if self.order_require_monotonic_update_id and update_id < previous_update_id:
+                return False, (
+                    f"non-monotonic orderUpdateId: orderId={order_id}, "
+                    f"received={update_id}, previous={previous_update_id}"
+                ), False
+
+            self.order_inflight[order_key] = payload_hash
+            return True, "", False
 
     def remember_order(self, payload):
         order_id = str(payload.get("orderId") or "").strip()
@@ -558,11 +579,21 @@ class CommNode(Node):
             update_id = int(payload.get("orderUpdateId"))
         except (TypeError, ValueError):
             return
-        self.order_history[order_id] = {
-            "orderUpdateId": update_id,
-            "payloadHash": self.order_payload_hash(payload),
-            "rememberedAt": time.time(),
-        }
+        with self.order_sequence_lock:
+            self.order_history[order_id] = {
+                "orderUpdateId": update_id,
+                "payloadHash": self.order_payload_hash(payload),
+                "rememberedAt": time.time(),
+            }
+
+    def clear_order_inflight(self, payload):
+        order_id = str(payload.get("orderId") or "").strip()
+        try:
+            update_id = int(payload.get("orderUpdateId"))
+        except (TypeError, ValueError):
+            return
+        with self.order_sequence_lock:
+            self.order_inflight.pop((order_id, update_id), None)
 
     def normalize_instant_action_routes(self, routes_config):
         routes = {}
@@ -880,7 +911,7 @@ class CommNode(Node):
             time.sleep(delay_sec)
 
         if self.timer.is_canceled():
-            self.timer = self.create_timer(1.0, self.publish_ros_state)
+            self.timer = self.create_timer(1.0, self.publish_ros_state, clock=self.steady_clock)
 
         self.start_connection_thread("UI manual reconnect")
 
@@ -976,15 +1007,60 @@ class CommNode(Node):
         if rc == 0:
             self.comm_state = "CONNECTED"
             self.get_logger().info("▶ [3] MQTT 접속 성공.")
-            
-            # Host MQTT interface는 comm_node/backend가 소유한다.
-            # UI는 표시/조작과 수동 publish 진단 경로만 유지한다.
-            if self.publish_connection_on_mqtt_connect:
-                self.mqtt_core.publish_by_template('connection', connectionState="CONNECTED")
-            self.clear_retained_topics("clear_on_connect")
-            self.clear_visualization_retained_if_disabled()
+
+            if self.should_wait_initial_broker_time_sync():
+                threading.Thread(
+                    target=self.publish_connected_after_broker_time_sync,
+                    daemon=True,
+                    name="broker-time-initial-connection-publish",
+                ).start()
+                return
+
+            self.publish_connected_payloads()
         else:
             self.get_logger().error(f"MQTT 접속 거부 (코드: {rc})")
+
+    def publish_connected_payloads(self):
+        if self.is_shutting_down or self.comm_state != "CONNECTED":
+            return
+        if not self.mqtt_core.connected:
+            return
+            
+        # Host MQTT interface는 comm_node/backend가 소유한다.
+        # UI는 표시/조작과 수동 publish 진단 경로만 유지한다.
+        if self.publish_connection_on_mqtt_connect:
+            self.mqtt_core.publish_by_template('connection', connectionState="CONNECTED")
+        self.clear_retained_topics("clear_on_connect")
+        self.clear_visualization_retained_if_disabled()
+
+    def should_wait_initial_broker_time_sync(self):
+        broker_cfg = self.config.get('time_sync', {}).get('broker_topic', {}) or {}
+        if not bool(broker_cfg.get('enabled', False)):
+            return False
+        return bool(broker_cfg.get('wait_for_initial_sync_on_connect', False))
+
+    def publish_connected_after_broker_time_sync(self):
+        self.wait_for_initial_broker_time_sync()
+        self.publish_connected_payloads()
+
+    def wait_for_initial_broker_time_sync(self):
+        broker_cfg = self.config.get('time_sync', {}).get('broker_topic', {}) or {}
+        if not bool(broker_cfg.get('enabled', False)):
+            return
+        if not bool(broker_cfg.get('wait_for_initial_sync_on_connect', False)):
+            return
+
+        timeout_sec = float(broker_cfg.get('initial_sync_timeout_sec', 2.0) or 0.0)
+        if timeout_sec <= 0:
+            return
+
+        if self.mqtt_core.wait_for_time_sync(timeout_sec):
+            self.get_logger().info("Broker time sync ready before connection publish.")
+        else:
+            self.get_logger().warn(
+                f"Broker time sync not received within {timeout_sec:.1f}s; "
+                "connection payload will use local/system timestamp."
+            )
 
     def on_mqtt_disconnect(self, rc):
         if self.is_shutting_down:
